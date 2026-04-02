@@ -710,6 +710,130 @@ server.tool("archive_case",
   }
 );
 
+// ─── rag_query（RAG: 検索→全文取得→文脈返却を一発で） ─────────
+server.tool("rag_query",
+  "RAG検索。質問に関連する記憶をキーワード検索+ベクトル検索の両方で探し、全文を文脈として返す。Claudeが過去の記憶を参照して回答する時に使う。",
+  {
+    query: z.string().describe("質問や検索クエリ（自然文OK）"),
+    limit: z.number().int().min(1).max(10).optional().default(5).describe("取得件数"),
+    case_id: z.string().optional().describe("案件IDで絞り込み"),
+  },
+  async ({ query, limit, case_id }) => {
+    const results = new Map(); // key: "type:id" → { type, id, score, source }
+
+    // 1. FTS5 キーワード検索
+    const words = query.trim().split(/\s+/);
+    const hasShortWord = words.some(w => [...w].length < 3);
+    let ftsRows;
+    if (hasShortWord) {
+      const likeClauses = words.map(() => "f.content LIKE ?").join(" AND ");
+      const likeParams = words.map(w => "%" + w + "%");
+      const caseFilter = case_id ? " AND t.case_id=?" : "";
+      const caseParams = case_id ? [case_id] : [];
+      ftsRows = db.prepare(
+        "SELECT 'note' as type, t.id FROM notes_fts f JOIN notes t ON f.rowid=t.id WHERE " + likeClauses + caseFilter +
+        " UNION ALL SELECT 'conversation', t.id FROM conversations_fts f JOIN conversations t ON f.rowid=t.id WHERE " +
+        likeClauses.replace(/f\.content/g, "f.content") + caseFilter + " LIMIT 20"
+      ).all(...likeParams, ...caseParams, ...likeParams, ...caseParams);
+    } else {
+      const q = words.join(" AND ");
+      if (case_id) {
+        ftsRows = db.prepare(
+          "SELECT 'note' as type, t.id FROM notes_fts f JOIN notes t ON f.rowid=t.id WHERE f MATCH ? AND t.case_id=?" +
+          " UNION ALL SELECT 'conversation', t.id FROM conversations_fts f JOIN conversations t ON f.rowid=t.id WHERE f MATCH ? AND t.case_id=? LIMIT 20"
+        ).all(q, case_id, q, case_id);
+      } else {
+        ftsRows = db.prepare(
+          "SELECT 'note' as type, t.id FROM notes_fts f JOIN notes t ON f.rowid=t.id WHERE f MATCH ?" +
+          " UNION ALL SELECT 'conversation', t.id FROM conversations_fts f JOIN conversations t ON f.rowid=t.id WHERE f MATCH ? LIMIT 20"
+        ).all(q, q);
+      }
+    }
+    for (let i = 0; i < ftsRows.length; i++) {
+      const r = ftsRows[i];
+      const k = r.type + ":" + r.id;
+      const score = 1.0 - (i * 0.03); // FTSは順位ベースのスコア
+      results.set(k, { type: r.type, id: r.id, score, sources: ["fts"] });
+    }
+
+    // 2. ベクトル検索（有効時のみ）
+    if (VECTOR_ENABLED) {
+      const queryVec = await getEmbedding(query);
+      if (queryVec) {
+        const allVecs = db.prepare("SELECT type, id, embedding FROM vectors").all();
+        const scored = allVecs.map(row => {
+          const vec = blobToVec(row.embedding);
+          return { type: row.type, id: row.id, sim: cosineSimilarity(queryVec, vec) };
+        });
+        scored.sort((a, b) => b.sim - a.sim);
+
+        for (const s of scored.slice(0, 20)) {
+          if (case_id) {
+            const table = s.type === "note" ? "notes" : "conversations";
+            const row = db.prepare("SELECT case_id FROM " + table + " WHERE id=?").get(s.id);
+            if (row?.case_id !== case_id) continue;
+          }
+          const k = s.type + ":" + s.id;
+          const existing = results.get(k);
+          if (existing) {
+            // 両方でヒット → スコアブースト
+            existing.score = Math.min(existing.score + s.sim * 0.5, 2.0);
+            existing.sources.push("vec");
+          } else {
+            results.set(k, { type: s.type, id: s.id, score: s.sim, sources: ["vec"] });
+          }
+        }
+      }
+    }
+
+    if (results.size === 0) {
+      return { content: [{ type: "text", text: "関連する記憶は見つかりませんでした。" }] };
+    }
+
+    // 3. スコア順にソートして上位を全文取得
+    const sorted = [...results.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+
+    // ヘブ則: 検索結果を記録
+    recordSearchResults(sorted.map(r => ({ type: r.type, id: r.id })));
+
+    const chunks = [];
+    for (const r of sorted) {
+      const src = r.sources.join("+");
+      if (r.type === "note") {
+        const n = db.prepare("SELECT key, content, tags, case_id, created_at FROM notes WHERE id=?").get(r.id);
+        if (!n) continue;
+        const keyName = n.key ?? "(無題)";
+        const caseTag = n.case_id ? " [案件:" + n.case_id + "]" : "";
+        chunks.push(
+          "--- メモ id:" + r.id + ' "' + keyName + '" (' + src + " score:" + r.score.toFixed(2) + ")" + caseTag + " " + n.created_at + " ---\n" +
+          decrypt(n.content)
+        );
+      } else {
+        const c = db.prepare("SELECT title, summary, content, tags, case_id, created_at FROM conversations WHERE id=?").get(r.id);
+        if (!c) continue;
+        const titleStr = decrypt(c.title) ?? "(不明)";
+        const caseTag = c.case_id ? " [案件:" + c.case_id + "]" : "";
+        const summaryStr = decrypt(c.summary);
+        const contentStr = decrypt(c.content);
+        // 会話は長いのでsummaryがあればsummary優先、なければ先頭2000文字
+        const body = summaryStr ? "要約: " + summaryStr + "\n\n" + (contentStr?.slice(0, 2000) ?? "") : (contentStr?.slice(0, 3000) ?? "");
+        chunks.push(
+          "--- 会話 id:" + r.id + ' "' + titleStr + '" (' + src + " score:" + r.score.toFixed(2) + ")" + caseTag + " " + c.created_at + " ---\n" +
+          body
+        );
+      }
+    }
+
+    const related = getRelatedMemories(sorted.map(r => ({ type: r.type, id: r.id })));
+    return {
+      content: [{
+        type: "text",
+        text: "📚 RAG検索: " + sorted.length + "件の関連記憶\n\n" + chunks.join("\n\n") + related,
+      }],
+    };
+  }
+);
+
 // ─── semantic_search（ベクトル検索） ────────────────────────────
 server.tool("semantic_search",
   "意味的類似検索。キーワードが思い出せない時や、関連する記憶を広く探したい時に使う。EMBEDDING_API_KEY設定時のみ有効。",

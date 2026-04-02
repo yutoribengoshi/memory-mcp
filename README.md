@@ -75,6 +75,7 @@ Also supports custom endpoints (Ollama, LMStudio, etc.):
 | `save_conversation` | Save full conversation |
 | `search_memory` | Full-text search (Japanese + Hebbian links) |
 | `semantic_search` | Vector similarity search (requires API key) |
+| `rag_query` | RAG: hybrid search (FTS + vector) with full-text context retrieval |
 | `list_conversations` | List saved conversations |
 | `get_conversation` | Get full conversation by ID |
 | `delete_conversation` | Delete a conversation |
@@ -204,6 +205,9 @@ Claude Code のチャットでそのまま使えます。
 
 「認証に関連する記憶を広く探して」
 → semantic_search でベクトル類似検索
+
+「この案件の経緯を踏まえて回答して」
+→ rag_query でキーワード+ベクトルのハイブリッド検索、全文を文脈として取得
 ```
 
 ## ツール一覧
@@ -214,6 +218,7 @@ Claude Code のチャットでそのまま使えます。
 | `save_conversation` | 会話全文を保存 |
 | `search_memory` | 全文検索（日本語対応 + ヘブ則リンク表示） |
 | `semantic_search` | ベクトル類似検索（APIキー設定時のみ） |
+| `rag_query` | RAG検索: キーワード+ベクトルのハイブリッド検索で全文を文脈として返す |
 | `list_conversations` | 保存済み会話の一覧 |
 | `get_conversation` | 会話全文を取得 |
 | `delete_conversation` | 会話を削除 |
