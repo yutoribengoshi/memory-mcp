@@ -15,6 +15,12 @@ mkdirSync(DATA_DIR, { recursive: true });
 const DB_PATH = join(DATA_DIR, "memory.db");
 const KEY_PATH = join(DATA_DIR, ".key");
 
+// ─── ベクトル検索設定（オプション） ─────────────────────────────────
+const EMBEDDING_API_KEY = process.env.EMBEDDING_API_KEY ?? process.env.OPENAI_API_KEY ?? null;
+const EMBEDDING_URL = process.env.EMBEDDING_URL ?? "https://api.openai.com/v1/embeddings";
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL ?? "text-embedding-3-small";
+const VECTOR_ENABLED = !!EMBEDDING_API_KEY;
+
 function loadOrCreateKey() {
   if (existsSync(KEY_PATH)) {
     return readFileSync(KEY_PATH);
@@ -109,6 +115,18 @@ db.exec(`
 // conversations, notes に case_id カラム追加（マイグレーション）
 try { db.exec(`ALTER TABLE conversations ADD COLUMN case_id TEXT`); } catch {}
 try { db.exec(`ALTER TABLE notes ADD COLUMN case_id TEXT`); } catch {}
+
+// ─── ベクトルテーブル（オプション） ─────────────────────────────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS vectors (
+    type TEXT NOT NULL,
+    id INTEGER NOT NULL,
+    embedding BLOB NOT NULL,
+    model TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    PRIMARY KEY (type, id)
+  );
+`);
 
 // ─── ヘブ則テーブル（feature 5） ────────────────────────────────
 db.exec(`
@@ -286,6 +304,52 @@ function getRelatedMemories(results) {
   return `\n\n🔗 関連メモ（ヘブ則）:\n${lines.join("\n")}`;
 }
 
+// ─── ベクトル検索ヘルパー ───────────────────────────────────────
+async function getEmbedding(text) {
+  if (!VECTOR_ENABLED) return null;
+  try {
+    const res = await fetch(EMBEDDING_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${EMBEDDING_API_KEY}`,
+      },
+      body: JSON.stringify({ model: EMBEDDING_MODEL, input: text }),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json.data?.[0]?.embedding ?? null;
+  } catch { return null; }
+}
+
+function vecToBlob(vec) {
+  return Buffer.from(new Float32Array(vec).buffer);
+}
+
+function blobToVec(buf) {
+  return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+}
+
+function cosineSimilarity(a, b) {
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB) || 1);
+}
+
+async function upsertVector(type, id, text) {
+  if (!VECTOR_ENABLED) return;
+  const vec = await getEmbedding(text);
+  if (!vec) return;
+  db.prepare(`INSERT INTO vectors(type, id, embedding, model) VALUES(?,?,?,?)
+    ON CONFLICT(type, id) DO UPDATE SET embedding=excluded.embedding, model=excluded.model,
+    created_at=datetime('now','localtime')`)
+    .run(type, id, vecToBlob(vec), EMBEDDING_MODEL);
+}
+
 // ─── ブロードキャスト（feature 2） ──────────────────────────────
 // claude-peers broker (localhost:7899) の /list-peers → /send-message で全peerに配信
 const PEERS_TOKEN_PATH = join(homedir(), ".claude-peers.token");
@@ -362,7 +426,7 @@ server.tool("save_conversation",
     source:  z.string().optional().describe("出典(デフォルト: claude)"),
     case_id: z.string().optional().describe("案件ID"),
   },
-  ({ title, content, summary, tags, source, case_id }) => {
+  async ({ title, content, summary, tags, source, case_id }) => {
     const t = autoProjectTag(tags ?? []);
     const tagsJson = JSON.stringify(t);
     const r = db.prepare(
@@ -371,6 +435,7 @@ server.tool("save_conversation",
     const id = Number(r.lastInsertRowid);
     syncConvFts(id, title, summary, content, tagsJson);
     if (case_id) initCaseLinks("conversation", id, case_id);
+    await upsertVector("conversation", id, `${title} ${summary ?? ""} ${content}`.slice(0, 8000));
     return { content: [{ type: "text", text: `✅ 保存完了 id:${id} "${title}"${case_id ? ` case:${case_id}` : ""}` }] };
   }
 );
@@ -384,7 +449,7 @@ server.tool("save_note",
     tags:    z.array(z.string()).optional(),
     case_id: z.string().optional().describe("案件ID"),
   },
-  ({ content, key, tags, case_id }) => {
+  async ({ content, key, tags, case_id }) => {
     const t = autoProjectTag(tags ?? []);
     const tagsJson = JSON.stringify(t);
     let id;
@@ -400,6 +465,7 @@ server.tool("save_note",
     }
     syncNoteFts(id, key, content, tagsJson);
     if (case_id) initCaseLinks("note", id, case_id);
+    await upsertVector("note", id, `${key ?? ""} ${content}`.slice(0, 8000));
     return { content: [{ type: "text", text: `✅ メモ保存 id:${id}${key ? ` key:${key}` : ""}${case_id ? ` case:${case_id}` : ""}` }] };
   }
 );
@@ -567,7 +633,7 @@ server.tool("save_case_note",
     key:     z.string().optional().describe("キー名(上書き用)"),
     tags:    z.array(z.string()).optional(),
   },
-  ({ case_id, case_name, content, key, tags }) => {
+  async ({ case_id, case_name, content, key, tags }) => {
     // 案件自動登録
     const existing = db.prepare(`SELECT case_id FROM cases WHERE case_id=?`).get(case_id);
     if (!existing) {
@@ -589,6 +655,7 @@ server.tool("save_case_note",
     }
     syncNoteFts(id, key, content, tagsJson);
     initCaseLinks("note", id, case_id);
+    await upsertVector("note", id, `${key ?? ""} ${content}`.slice(0, 8000));
     return { content: [{ type: "text", text: `✅ 案件メモ保存 id:${id} case:${case_id}${key ? ` key:${key}` : ""}` }] };
   }
 );
@@ -643,6 +710,81 @@ server.tool("archive_case",
   }
 );
 
+// ─── semantic_search（ベクトル検索） ────────────────────────────
+server.tool("semantic_search",
+  "意味的類似検索。キーワードが思い出せない時や、関連する記憶を広く探したい時に使う。EMBEDDING_API_KEY設定時のみ有効。",
+  {
+    query: z.string().describe("検索クエリ（自然文OK）"),
+    limit: z.number().int().min(1).max(20).optional().default(5).describe("最大件数"),
+    case_id: z.string().optional().describe("案件IDで絞り込み"),
+  },
+  async ({ query, limit, case_id }) => {
+    if (!VECTOR_ENABLED) {
+      return { content: [{ type: "text", text: "⚠️ ベクトル検索は無効です。EMBEDDING_API_KEY または OPENAI_API_KEY を設定してください。" }] };
+    }
+    const queryVec = await getEmbedding(query);
+    if (!queryVec) {
+      return { content: [{ type: "text", text: "⚠️ Embeddingの取得に失敗しました。" }] };
+    }
+
+    const allVecs = db.prepare(`SELECT type, id, embedding FROM vectors`).all();
+    if (!allVecs.length) {
+      return { content: [{ type: "text", text: "ベクトルデータがありません。メモを保存するとベクトルが自動生成されます。" }] };
+    }
+
+    // コサイン類似度で全件スコアリング
+    const scored = allVecs.map(row => {
+      const vec = blobToVec(row.embedding);
+      const sim = cosineSimilarity(queryVec, vec);
+      return { type: row.type, id: row.id, similarity: sim };
+    });
+    scored.sort((a, b) => b.similarity - a.similarity);
+
+    // case_idフィルタ適用 & 上位取得
+    const results = [];
+    for (const s of scored) {
+      if (results.length >= limit) break;
+      if (case_id) {
+        const table = s.type === "note" ? "notes" : "conversations";
+        const row = db.prepare(`SELECT case_id FROM ${table} WHERE id=?`).get(s.id);
+        if (row?.case_id !== case_id) continue;
+      }
+      results.push(s);
+    }
+
+    if (!results.length) {
+      return { content: [{ type: "text", text: `「${query}」に類似するデータはありません。` }] };
+    }
+
+    // ヘブ則: 検索結果を記録
+    recordSearchResults(results.map(r => ({ type: r.type, id: r.id })));
+
+    const lines = results.map(r => {
+      let label = "";
+      if (r.type === "note") {
+        const n = db.prepare(`SELECT key, content FROM notes WHERE id=?`).get(r.id);
+        if (!n) return null;
+        const keyName = n.key ?? "(無題)";
+        label = "[メモ] id:" + r.id + ' "' + keyName + '"';
+        const content = decrypt(n.content);
+        const sim = (r.similarity * 100).toFixed(1);
+        return label + " (類似度:" + sim + "%)\n  " + (content?.slice(0, 100) ?? "") + "…";
+      } else {
+        const c = db.prepare(`SELECT title, summary FROM conversations WHERE id=?`).get(r.id);
+        if (!c) return null;
+        const titleStr = decrypt(c.title) ?? "(不明)";
+        label = "[会話] id:" + r.id + ' "' + titleStr + '"';
+        const sim = (r.similarity * 100).toFixed(1);
+        const summaryStr = decrypt(c.summary) ?? "(要約なし)";
+        return label + " (類似度:" + sim + "%)\n  " + summaryStr;
+      }
+    }).filter(Boolean);
+
+    const related = getRelatedMemories(results.map(r => ({ type: r.type, id: r.id })));
+    return { content: [{ type: "text", text: `🔍 セマンティック検索: ${lines.length}件\n\n${lines.join("\n\n")}${related}` }] };
+  }
+);
+
 // ─── ヘブ則ツール（feature 5） ──────────────────────────────────
 server.tool("get_memory_links",
   "指定メモ/会話のヘブ則リンク(関連記憶)を取得",
@@ -683,6 +825,7 @@ server.tool("memory_stats",
     const caseCount = db.prepare(`SELECT COUNT(*) as c FROM cases WHERE status='active'`).get().c;
     const avgWeight = db.prepare(`SELECT AVG(weight) as a FROM memory_links`).get().a ?? 0;
     const strongLinks = db.prepare(`SELECT COUNT(*) as c FROM memory_links WHERE weight > 0.5`).get().c;
+    const vecCount = db.prepare(`SELECT COUNT(*) as c FROM vectors`).get().c;
     return {
       content: [{
         type: "text",
@@ -692,6 +835,7 @@ server.tool("memory_stats",
           `  会話: ${convCount}件`,
           `  案件: ${caseCount}件 (active)`,
           `  ヘブ則リンク: ${linkCount}件 (avg_w: ${avgWeight.toFixed(3)}, strong>0.5: ${strongLinks}件)`,
+          `  ベクトル: ${vecCount}件 ${VECTOR_ENABLED ? `✅ (${EMBEDDING_MODEL})` : "⚠️ 無効 (EMBEDDING_API_KEY未設定)"}`,
           `  DB: ${DB_PATH}`,
           `  暗号化: AES-256-GCM ✅`,
         ].join("\n"),

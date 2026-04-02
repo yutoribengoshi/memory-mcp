@@ -1,5 +1,129 @@
 # memory-mcp
 
+> "Why does my Claude Code feel smarter than everyone else's?"
+
+Long-term memory MCP server for Claude Code. Your AI remembers context across sessions.
+
+**[日本語](#日本語) | English**
+
+## Features
+
+- **SQLite Persistence** — Notes and conversations survive across sessions
+- **Japanese Full-Text Search** — FTS5 with trigram tokenizer for CJK support
+- **Semantic Search** — Optional vector search via OpenAI-compatible embedding APIs
+- **AES-256-GCM Encryption** — All stored data is encrypted at rest
+- **Case Management** — Organize memories by project or case
+- **Hebbian Links** — Memories accessed together automatically strengthen their connections
+- **Broadcast** — Notify all Claude Code sessions via [claude-peers](https://github.com/AshGw/claude-peers)
+
+## Quick Start
+
+```bash
+git clone https://github.com/yutoribengoshi/memory-mcp.git
+cd memory-mcp
+npm install
+```
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "node",
+      "args": ["/path/to/memory-mcp/index.js"]
+    }
+  }
+}
+```
+
+### Optional: Enable Semantic Search
+
+Set an OpenAI-compatible API key to enable vector search:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "node",
+      "args": ["/path/to/memory-mcp/index.js"],
+      "env": {
+        "OPENAI_API_KEY": "sk-..."
+      }
+    }
+  }
+}
+```
+
+Also supports custom endpoints (Ollama, LMStudio, etc.):
+
+```json
+{
+  "env": {
+    "EMBEDDING_API_KEY": "your-key",
+    "EMBEDDING_URL": "http://localhost:11434/v1/embeddings",
+    "EMBEDDING_MODEL": "nomic-embed-text"
+  }
+}
+```
+
+## Tools
+
+| Tool | Description |
+|------|-------------|
+| `save_note` | Save a note (upsert by key) |
+| `save_conversation` | Save full conversation |
+| `search_memory` | Full-text search (Japanese + Hebbian links) |
+| `semantic_search` | Vector similarity search (requires API key) |
+| `list_conversations` | List saved conversations |
+| `get_conversation` | Get full conversation by ID |
+| `delete_conversation` | Delete a conversation |
+| `save_case_note` | Save note linked to a case |
+| `list_cases` | List all cases |
+| `get_case` | Get case details with notes and conversations |
+| `archive_case` | Archive a case |
+| `broadcast_note` | Save and broadcast to all sessions |
+| `get_memory_links` | View Hebbian links for a memory |
+| `memory_stats` | Show statistics |
+
+## How It Works
+
+### Hebbian Links
+
+Inspired by Hebb's rule in neuroscience — "neurons that fire together wire together."
+
+- Memories searched within 5 minutes of each other get automatically linked
+- Memories in the same case get linked
+- Links strengthen with repeated co-access
+- Unused links decay after 30 days (weight x 0.95)
+- Links below 0.01 are pruned
+
+### Data Storage
+
+```
+~/.memory-mcp/
+├── memory.db    # SQLite database (encrypted)
+└── .key         # AES-256-GCM encryption key (chmod 600)
+```
+
+## Requirements
+
+- Node.js 22+ (uses built-in `node:sqlite`)
+- Claude Code
+- Optional: OpenAI API key for semantic search
+
+## License
+
+MIT
+
+## Author
+
+Tomoyuki Seki ([@yutoribengoshi](https://github.com/yutoribengoshi))
+
+---
+
+# 日本語
+
 > 「なんか俺のClaude Codeだけ賢くね？」の正体
 
 Claude Code 用の長期記憶 MCP サーバー。セッションを跨いでもメモ・会話の文脈を忘れません。
@@ -8,6 +132,7 @@ Claude Code 用の長期記憶 MCP サーバー。セッションを跨いでも
 
 - **SQLite 永続化** — メモ・会話を SQLite に保存。セッション終了後も記憶が残る
 - **日本語全文検索** — FTS5 trigram トークナイザーで日本語の部分一致検索に対応
+- **セマンティック検索** — OpenAI互換のEmbedding APIでベクトル類似検索（オプション）
 - **AES-256-GCM 暗号化** — 保存データは自動で暗号化。鍵は `~/.memory-mcp/.key` に保持
 - **案件別管理** — 案件（case）単位でメモ・会話を整理。弁護士の実務から生まれた設計
 - **ヘブ則リンク** — 連続検索されたメモを自動リンク。使うほど関連記憶が強化される
@@ -16,8 +141,7 @@ Claude Code 用の長期記憶 MCP サーバー。セッションを跨いでも
 ## インストール
 
 ```bash
-# リポジトリをクローン
-git clone https://github.com/sekitomoyuki/memory-mcp.git
+git clone https://github.com/yutoribengoshi/memory-mcp.git
 cd memory-mcp
 npm install
 ```
@@ -37,6 +161,36 @@ npm install
 }
 ```
 
+### オプション: セマンティック検索を有効化
+
+OpenAI互換のAPIキーを設定するとベクトル検索が使えます:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "node",
+      "args": ["/path/to/memory-mcp/index.js"],
+      "env": {
+        "OPENAI_API_KEY": "sk-..."
+      }
+    }
+  }
+}
+```
+
+Ollama や LMStudio などのローカルモデルも対応:
+
+```json
+{
+  "env": {
+    "EMBEDDING_API_KEY": "your-key",
+    "EMBEDDING_URL": "http://localhost:11434/v1/embeddings",
+    "EMBEDDING_MODEL": "nomic-embed-text"
+  }
+}
+```
+
 ## 使い方
 
 Claude Code のチャットでそのまま使えます。
@@ -48,8 +202,8 @@ Claude Code のチャットでそのまま使えます。
 「認証フローについて前に何か決めたっけ？」
 → search_memory で全文検索、ヘブ則で関連メモも表示
 
-「この会話を保存して」
-→ save_conversation で会話全体を保存
+「認証に関連する記憶を広く探して」
+→ semantic_search でベクトル類似検索
 ```
 
 ## ツール一覧
@@ -59,6 +213,7 @@ Claude Code のチャットでそのまま使えます。
 | `save_note` | メモを保存（key 指定で上書き可） |
 | `save_conversation` | 会話全文を保存 |
 | `search_memory` | 全文検索（日本語対応 + ヘブ則リンク表示） |
+| `semantic_search` | ベクトル類似検索（APIキー設定時のみ） |
 | `list_conversations` | 保存済み会話の一覧 |
 | `get_conversation` | 会話全文を取得 |
 | `delete_conversation` | 会話を削除 |
@@ -69,14 +224,6 @@ Claude Code のチャットでそのまま使えます。
 | `broadcast_note` | メモを保存し全セッションに通知 |
 | `get_memory_links` | ヘブ則リンク（関連記憶）を取得 |
 | `memory_stats` | 統計情報 |
-
-## データ保存先
-
-```
-~/.memory-mcp/
-├── memory.db    # SQLite データベース（暗号化済み）
-└── .key         # AES-256-GCM 暗号鍵（chmod 600）
-```
 
 ## ヘブ則リンクとは
 
@@ -92,6 +239,7 @@ Claude Code のチャットでそのまま使えます。
 
 - Node.js 22+（`node:sqlite` を使用）
 - Claude Code
+- オプション: OpenAI APIキー（セマンティック検索用）
 
 ## ライセンス
 
@@ -99,4 +247,4 @@ MIT
 
 ## 作者
 
-Tomoyuki Seki（[@sekitomoyuki](https://github.com/sekitomoyuki)）
+Tomoyuki Seki（[@yutoribengoshi](https://github.com/yutoribengoshi)）
