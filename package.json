@@ -1,0 +1,35 @@
+{
+  "name": "memory-mcp",
+  "version": "1.0.0",
+  "description": "Long-term memory MCP server for Claude Code — persistent notes, conversations, full-text search (Japanese), case management, Hebbian links, and AES-256-GCM encryption",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "memory-mcp": "index.js"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "claude-code",
+    "memory",
+    "long-term-memory",
+    "sqlite",
+    "japanese",
+    "fts5",
+    "encryption",
+    "hebbian"
+  ],
+  "author": "Tomoyuki Seki",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sekitomoyuki/memory-mcp.git"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.22.4"
+  }
+}

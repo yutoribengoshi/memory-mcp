@@ -1,0 +1,8 @@
+node_modules/
+.memory-mcp/
+*.db
+*.db-wal
+*.db-shm
+.key
+.env
+.DS_Store
