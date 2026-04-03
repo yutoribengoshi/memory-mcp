@@ -1,0 +1,33 @@
+# Smithery configuration file: https://smithery.ai/docs/config#smitheryyaml
+
+startCommand:
+  type: stdio
+
+configSchema:
+  type: object
+  required: []
+  properties:
+    embeddingApiKey:
+      type: string
+      description: "OpenAI-compatible API key for semantic search (optional). Defaults to Ollama."
+    embeddingUrl:
+      type: string
+      default: "http://localhost:11434/v1/embeddings"
+      description: "Embedding API endpoint URL"
+    embeddingModel:
+      type: string
+      default: "nomic-embed-text"
+      description: "Embedding model name"
+
+commandFunction: |-
+  (config) => ({
+    command: 'node',
+    args: ['index.js'],
+    env: {
+      EMBEDDING_API_KEY: config.embeddingApiKey || '',
+      EMBEDDING_URL: config.embeddingUrl || 'http://localhost:11434/v1/embeddings',
+      EMBEDDING_MODEL: config.embeddingModel || 'nomic-embed-text'
+    }
+  })
+
+exampleConfig: {}
