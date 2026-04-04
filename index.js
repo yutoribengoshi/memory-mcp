@@ -417,14 +417,14 @@ const server = new McpServer({ name: "memory-mcp", version: "2.0.0" });
 
 // ─── save_conversation ──────────────────────────────────────────
 server.tool("save_conversation",
-  "現在のチャット会話をSQLiteに保存。「このチャットを保存して」で使う。",
+  "Save a chat conversation to SQLite. / 現在のチャット会話をSQLiteに保存。",
   {
-    title:   z.string().describe("タイトル"),
-    content: z.string().describe("会話の全文"),
-    summary: z.string().optional().describe("1〜3行の要約"),
-    tags:    z.array(z.string()).optional().describe("タグ配列"),
-    source:  z.string().optional().describe("出典(デフォルト: claude)"),
-    case_id: z.string().optional().describe("案件ID"),
+    title:   z.string().describe("Title / タイトル"),
+    content: z.string().describe("Full conversation text / 会話の全文"),
+    summary: z.string().optional().describe("1-3 line summary / 1〜3行の要約"),
+    tags:    z.array(z.string()).optional().describe("Tags / タグ配列"),
+    source:  z.string().optional().describe("Source (default: claude) / 出典"),
+    case_id: z.string().optional().describe("Case ID / 案件ID"),
   },
   async ({ title, content, summary, tags, source, case_id }) => {
     const t = autoProjectTag(tags ?? []);
@@ -442,12 +442,12 @@ server.tool("save_conversation",
 
 // ─── save_note ──────────────────────────────────────────────────
 server.tool("save_note",
-  "短いメモ・決定事項を保存。keyを指定すると上書き更新。",
+  "Save a short note or decision. Upsert by key. / 短いメモ・決定事項を保存。keyで上書き更新。",
   {
-    content: z.string().describe("テキスト"),
-    key:     z.string().optional().describe("キー名(上書き用)"),
+    content: z.string().describe("Text content / テキスト"),
+    key:     z.string().optional().describe("Key for upsert / キー名(上書き用)"),
     tags:    z.array(z.string()).optional(),
-    case_id: z.string().optional().describe("案件ID"),
+    case_id: z.string().optional().describe("Case ID / 案件ID"),
   },
   async ({ content, key, tags, case_id }) => {
     const t = autoProjectTag(tags ?? []);
@@ -472,9 +472,9 @@ server.tool("save_note",
 
 // ─── broadcast_note（feature 2） ────────────────────────────────
 server.tool("broadcast_note",
-  "メモを保存し、他のClaude Codeセッション(localhost:7899)にブロードキャスト。peersが未起動でもメモ保存は成功する。",
+  "Save note and broadcast to other Claude Code sessions. / メモを保存し他セッションにブロードキャスト。",
   {
-    content: z.string().describe("ブロードキャストする内容"),
+    content: z.string().describe("Content to broadcast / ブロードキャストする内容"),
     tags:    z.array(z.string()).optional(),
   },
   async ({ content, tags }) => {
@@ -492,10 +492,10 @@ server.tool("broadcast_note",
 
 // ─── search_memory（ヘブ則対応） ────────────────────────────────
 server.tool("search_memory",
-  "保存済みチャット・メモを全文検索(日本語対応)。ヘブ則で関連メモも表示。",
+  "Full-text search across saved notes and conversations (Japanese/CJK supported). Shows Hebbian linked memories. / 保存済みメモ・会話を全文検索(日本語対応)。ヘブ則リンクも表示。",
   {
-    query:   z.string().describe("キーワード(スペース区切りでAND)"),
-    case_id: z.string().optional().describe("案件IDで絞り込み"),
+    query:   z.string().describe("Keywords (space-separated AND) / キーワード(スペース区切りでAND)"),
+    case_id: z.string().optional().describe("Filter by case ID / 案件IDで絞り込み"),
   },
   ({ query, case_id }) => {
     const words = query.trim().split(/\s+/);
@@ -577,7 +577,7 @@ server.tool("search_memory",
 
 // ─── list_conversations ─────────────────────────────────────────
 server.tool("list_conversations",
-  "保存済み会話の一覧(新しい順)",
+  "List saved conversations (newest first). / 保存済み会話の一覧(新しい順)",
   { limit: z.number().int().min(1).max(50).optional().default(20) },
   ({ limit }) => {
     const rows = db.prepare(`SELECT id,title,summary,tags,created_at,case_id FROM conversations ORDER BY created_at DESC LIMIT ?`).all(limit);
@@ -596,7 +596,7 @@ server.tool("list_conversations",
 
 // ─── get_conversation ───────────────────────────────────────────
 server.tool("get_conversation",
-  "指定IDの会話全文を取得",
+  "Get full conversation by ID. / 指定IDの会話全文を取得",
   { id: z.number().int() },
   ({ id }) => {
     const row = db.prepare(`SELECT * FROM conversations WHERE id=?`).get(id);
@@ -613,7 +613,7 @@ server.tool("get_conversation",
 
 // ─── delete_conversation ────────────────────────────────────────
 server.tool("delete_conversation",
-  "指定IDの会話を削除",
+  "Delete a conversation by ID. / 指定IDの会話を削除",
   { id: z.number().int() },
   ({ id }) => {
     try { db.prepare(`DELETE FROM conversations_fts WHERE rowid=?`).run(id); } catch {}
@@ -625,12 +625,12 @@ server.tool("delete_conversation",
 
 // ─── 案件管理ツール（feature 4） ────────────────────────────────
 server.tool("save_case_note",
-  "案件に紐づけてメモを保存。案件が未登録なら自動作成。",
+  "Save a note linked to a case. Auto-creates case if not exists. / 案件に紐づけてメモを保存。案件が未登録なら自動作成。",
   {
-    case_id: z.string().describe("案件ID(例: shiraishi-2026)"),
-    case_name: z.string().optional().describe("案件名(新規登録時)"),
-    content: z.string().describe("メモ内容"),
-    key:     z.string().optional().describe("キー名(上書き用)"),
+    case_id: z.string().describe("Case ID (e.g. project-2026) / 案件ID"),
+    case_name: z.string().optional().describe("Case name (for new cases) / 案件名(新規登録時)"),
+    content: z.string().describe("Note content / メモ内容"),
+    key:     z.string().optional().describe("Key for upsert / キー名(上書き用)"),
     tags:    z.array(z.string()).optional(),
   },
   async ({ case_id, case_name, content, key, tags }) => {
@@ -661,8 +661,8 @@ server.tool("save_case_note",
 );
 
 server.tool("list_cases",
-  "登録済み案件の一覧。status='active'のみ or 全件。",
-  { include_archived: z.boolean().optional().default(false).describe("アーカイブ済みも含める") },
+  "List registered cases. / 登録済み案件の一覧。",
+  { include_archived: z.boolean().optional().default(false).describe("Include archived / アーカイブ済みも含める") },
   ({ include_archived }) => {
     const q = include_archived
       ? `SELECT * FROM cases ORDER BY updated_at DESC`
@@ -679,8 +679,8 @@ server.tool("list_cases",
 );
 
 server.tool("get_case",
-  "指定案件の詳細とメモ・会話一覧を取得",
-  { case_id: z.string().describe("案件ID") },
+  "Get case details with notes and conversations. / 指定案件の詳細とメモ・会話一覧を取得",
+  { case_id: z.string().describe("Case ID / 案件ID") },
   ({ case_id }) => {
     const c = db.prepare(`SELECT * FROM cases WHERE case_id=?`).get(case_id);
     if (!c) return { content: [{ type: "text", text: `案件 "${case_id}" は存在しません。` }] };
@@ -701,8 +701,8 @@ server.tool("get_case",
 );
 
 server.tool("archive_case",
-  "案件をアーカイブ(status='archived')。削除はしない(弁護士の記録保持義務)。",
-  { case_id: z.string().describe("案件ID") },
+  "Archive a case (does not delete). / 案件をアーカイブ(削除はしない)。",
+  { case_id: z.string().describe("Case ID / 案件ID") },
   ({ case_id }) => {
     const info = db.prepare(`UPDATE cases SET status='archived', updated_at=datetime('now','localtime') WHERE case_id=?`).run(case_id);
     if (info.changes === 0) return { content: [{ type: "text", text: `案件 "${case_id}" は存在しません。` }] };
@@ -712,11 +712,11 @@ server.tool("archive_case",
 
 // ─── rag_query（RAG: 検索→全文取得→文脈返却を一発で） ─────────
 server.tool("rag_query",
-  "RAG検索。質問に関連する記憶をキーワード検索+ベクトル検索の両方で探し、全文を文脈として返す。Claudeが過去の記憶を参照して回答する時に使う。",
+  "RAG search: hybrid keyword + vector search returning full context. Use when Claude needs past memories to answer. / RAG検索: キーワード+ベクトルで全文を文脈として返す。",
   {
-    query: z.string().describe("質問や検索クエリ（自然文OK）"),
-    limit: z.number().int().min(1).max(10).optional().default(5).describe("取得件数"),
-    case_id: z.string().optional().describe("案件IDで絞り込み"),
+    query: z.string().describe("Question or search query (natural language OK) / 質問や検索クエリ(自然文OK)"),
+    limit: z.number().int().min(1).max(10).optional().default(5).describe("Max results / 取得件数"),
+    case_id: z.string().optional().describe("Filter by case ID / 案件IDで絞り込み"),
   },
   async ({ query, limit, case_id }) => {
     const results = new Map(); // key: "type:id" → { type, id, score, source }
@@ -836,11 +836,11 @@ server.tool("rag_query",
 
 // ─── semantic_search（ベクトル検索） ────────────────────────────
 server.tool("semantic_search",
-  "意味的類似検索。キーワードが思い出せない時や、関連する記憶を広く探したい時に使う。EMBEDDING_API_KEY設定時のみ有効。",
+  "Semantic similarity search. Use when keywords are unclear. Requires EMBEDDING_API_KEY. / 意味的類似検索。キーワードが思い出せない時に使う。",
   {
-    query: z.string().describe("検索クエリ（自然文OK）"),
-    limit: z.number().int().min(1).max(20).optional().default(5).describe("最大件数"),
-    case_id: z.string().optional().describe("案件IDで絞り込み"),
+    query: z.string().describe("Search query (natural language OK) / 検索クエリ(自然文OK)"),
+    limit: z.number().int().min(1).max(20).optional().default(5).describe("Max results / 最大件数"),
+    case_id: z.string().optional().describe("Filter by case ID / 案件IDで絞り込み"),
   },
   async ({ query, limit, case_id }) => {
     if (!VECTOR_ENABLED) {
@@ -911,9 +911,9 @@ server.tool("semantic_search",
 
 // ─── ヘブ則ツール（feature 5） ──────────────────────────────────
 server.tool("get_memory_links",
-  "指定メモ/会話のヘブ則リンク(関連記憶)を取得",
+  "Get Hebbian links (associated memories) for a note or conversation. / 指定メモ/会話のヘブ則リンク(関連記憶)を取得",
   {
-    type: z.enum(["note", "conversation"]).describe("種別"),
+    type: z.enum(["note", "conversation"]).describe("Type / 種別"),
     id:   z.number().int().describe("ID"),
   },
   ({ type, id }) => {
@@ -940,7 +940,7 @@ server.tool("get_memory_links",
 );
 
 server.tool("memory_stats",
-  "メモリMCPの統計情報(総数・リンク数・案件数等)",
+  "Show memory statistics (counts, links, cases, vectors). / メモリMCPの統計情報",
   {},
   () => {
     const noteCount = db.prepare(`SELECT COUNT(*) as c FROM notes`).get().c;
@@ -963,6 +963,90 @@ server.tool("memory_stats",
           `  DB: ${DB_PATH}`,
           `  暗号化: AES-256-GCM ✅`,
         ].join("\n"),
+      }],
+    };
+  }
+);
+
+// ─── export_memory（mdエクスポート） ────────────────────────────
+server.tool("export_memory",
+  "Export memories as a Markdown file. Useful for backup, sharing, or loading into other tools. / 記憶をMarkdownファイルとしてエクスポート。バックアップや他ツールへの読み込みに。",
+  {
+    case_id: z.string().optional().describe("Export only this case / この案件のみエクスポート"),
+    output_path: z.string().optional().describe("Output file path (default: ~/memory-export.md) / 出力先パス"),
+    include_conversations: z.boolean().optional().default(true).describe("Include conversations / 会話を含める"),
+    include_notes: z.boolean().optional().default(true).describe("Include notes / メモを含める"),
+  },
+  ({ case_id, output_path, include_conversations, include_notes }) => {
+    const outPath = output_path ?? join(homedir(), "memory-export.md");
+    const lines = [];
+    const caseLabel = case_id ? " (case: " + case_id + ")" : "";
+    lines.push("# Memory Export" + caseLabel);
+    lines.push("Exported: " + new Date().toISOString());
+    lines.push("");
+
+    if (include_notes) {
+      const noteQuery = case_id
+        ? "SELECT id, key, content, tags, case_id, created_at FROM notes WHERE case_id=? ORDER BY created_at DESC"
+        : "SELECT id, key, content, tags, case_id, created_at FROM notes ORDER BY created_at DESC";
+      const notes = case_id ? db.prepare(noteQuery).all(case_id) : db.prepare(noteQuery).all();
+
+      if (notes.length) {
+        lines.push("## Notes (" + notes.length + ")");
+        lines.push("");
+        for (const n of notes) {
+          const keyName = n.key ?? "(untitled)";
+          const caseTag = n.case_id ? " [case:" + n.case_id + "]" : "";
+          lines.push("### " + keyName + caseTag);
+          lines.push("- ID: " + n.id);
+          lines.push("- Created: " + n.created_at);
+          lines.push("- Tags: " + (n.tags ?? "[]"));
+          lines.push("");
+          lines.push(decrypt(n.content) ?? "");
+          lines.push("");
+          lines.push("---");
+          lines.push("");
+        }
+      }
+    }
+
+    if (include_conversations) {
+      const convQuery = case_id
+        ? "SELECT id, title, summary, content, tags, case_id, created_at FROM conversations WHERE case_id=? ORDER BY created_at DESC"
+        : "SELECT id, title, summary, content, tags, case_id, created_at FROM conversations ORDER BY created_at DESC";
+      const convs = case_id ? db.prepare(convQuery).all(case_id) : db.prepare(convQuery).all();
+
+      if (convs.length) {
+        lines.push("## Conversations (" + convs.length + ")");
+        lines.push("");
+        for (const c of convs) {
+          const titleStr = decrypt(c.title) ?? "(unknown)";
+          const caseTag = c.case_id ? " [case:" + c.case_id + "]" : "";
+          lines.push("### " + titleStr + caseTag);
+          lines.push("- ID: " + c.id);
+          lines.push("- Created: " + c.created_at);
+          lines.push("- Tags: " + (c.tags ?? "[]"));
+          const summaryStr = decrypt(c.summary);
+          if (summaryStr) {
+            lines.push("- Summary: " + summaryStr);
+          }
+          lines.push("");
+          lines.push(decrypt(c.content) ?? "");
+          lines.push("");
+          lines.push("---");
+          lines.push("");
+        }
+      }
+    }
+
+    const md = lines.join("\n");
+    writeFileSync(outPath, md, "utf-8");
+    const noteCount = include_notes ? db.prepare("SELECT COUNT(*) as c FROM notes" + (case_id ? " WHERE case_id=?" : "")).get(...(case_id ? [case_id] : [])).c : 0;
+    const convCount = include_conversations ? db.prepare("SELECT COUNT(*) as c FROM conversations" + (case_id ? " WHERE case_id=?" : "")).get(...(case_id ? [case_id] : [])).c : 0;
+    return {
+      content: [{
+        type: "text",
+        text: "📄 Exported to " + outPath + " (" + noteCount + " notes, " + convCount + " conversations, " + (md.length / 1024).toFixed(1) + "KB)",
       }],
     };
   }
