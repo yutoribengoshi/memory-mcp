@@ -534,6 +534,19 @@ server.tool("broadcast_note",
   }
 );
 
+// ─── FTSクエリ構築（ユーザー入力エスケープ） ─────────────────────
+// FTS5 は bareword 中の - : * 等を列フィルタ/演算子として解釈するため、
+// 各語をフレーズクォートしてリテラル化する（"project-layout" 等で必須）。
+// tokenize='trigram' ではクォートしてもヒット集合は不変。
+function buildFtsQuery(words) {
+  return words.map(w => w.replace(/\*+$/, "")).filter(Boolean)
+              .map(w => `"${w.replaceAll('"', '""')}"`).join(" AND ");
+}
+// LIKE分岐用: % _ \ のワイルドカード解釈を防ぐ（LIKE ? ESCAPE '\' とペアで使う）
+function escapeLike(w) {
+  return w.replace(/[\\%_]/g, c => "\\" + c);
+}
+
 // ─── search_memory（ヘブ則対応） ────────────────────────────────
 server.tool("search_memory",
   "Full-text search across saved notes and conversations (Japanese/CJK supported). Shows Hebbian linked memories. / 保存済みメモ・会話を全文検索(日本語対応)。ヘブ則リンクも表示。",
@@ -560,8 +573,8 @@ server.tool("search_memory",
 
     let rows;
     if (hasShortWord) {
-      const likeClauses = words.map(() => "content LIKE ?").join(" AND ");
-      const likeParams = words.map(w => `%${w}%`);
+      const likeClauses = words.map(() => "content LIKE ? ESCAPE '\\'").join(" AND ");
+      const likeParams = words.map(w => `%${escapeLike(w)}%`);
       rows = db.prepare(`
         SELECT 'conversation' as type, c.id, c.title as key_enc,
           '' as snip, c.created_at, c.case_id, NULL as valid_at, NULL as invalid_at
@@ -577,7 +590,8 @@ server.tool("search_memory",
         ORDER BY created_at DESC LIMIT 20
       `).all(...likeParams, ...convParams, ...likeParams, ...noteParams);
     } else {
-      const q = words.join(" AND ");
+      const q = buildFtsQuery(words);
+      if (!q) return { content: [{ type: "text", text: `「${query}」に一致するデータはありません。` }] };
       rows = db.prepare(`
         SELECT 'conversation' as type, c.id, c.title as key_enc,
           snippet(conversations_fts,2,'【','】','…',20) as snip, c.created_at, c.case_id, NULL as valid_at, NULL as invalid_at
@@ -857,9 +871,9 @@ server.tool("rag_query",
     const hasShortWord = words.some(w => [...w].length < 3);
     let ftsRows;
     if (hasShortWord) {
-      const notesLike = words.map(() => "notes_fts.content LIKE ?").join(" AND ");
-      const convsLike = words.map(() => "conversations_fts.content LIKE ?").join(" AND ");
-      const likeParams = words.map(w => "%" + w + "%");
+      const notesLike = words.map(() => "notes_fts.content LIKE ? ESCAPE '\\'").join(" AND ");
+      const convsLike = words.map(() => "conversations_fts.content LIKE ? ESCAPE '\\'").join(" AND ");
+      const likeParams = words.map(w => "%" + escapeLike(w) + "%");
       const caseFilter = case_id ? " AND t.case_id=?" : "";
       const caseParams = case_id ? [case_id] : [];
       ftsRows = db.prepare(
@@ -868,8 +882,10 @@ server.tool("rag_query",
         convsLike + caseFilter + " LIMIT 20"
       ).all(...likeParams, ...caseParams, ...likeParams, ...caseParams);
     } else {
-      const q = words.join(" AND ");
-      if (case_id) {
+      const q = buildFtsQuery(words);
+      if (!q) {
+        ftsRows = []; // 全語が * のみ等で空クエリ → FTSヒットなし扱い（ベクトル検索は継続）
+      } else if (case_id) {
         ftsRows = db.prepare(
           "SELECT 'note' as type, t.id FROM notes_fts JOIN notes t ON notes_fts.rowid=t.id WHERE notes_fts MATCH ? AND t.case_id=?" +
           " UNION ALL SELECT 'conversation', t.id FROM conversations_fts JOIN conversations t ON conversations_fts.rowid=t.id WHERE conversations_fts MATCH ? AND t.case_id=? LIMIT 20"
