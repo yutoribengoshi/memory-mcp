@@ -60,7 +60,7 @@ function decrypt(b64) {
 }
 
 function isEncrypted(text) {
-  if (text == null) return true; // nullはスキップ
+  if (text == null) return false; // M2 fix: null は暗号化されていないのでfalse
   try {
     const buf = Buffer.from(text, "base64");
     // iv(12) + tag(16) + 最低1byte = 29以上、かつbase64としてデコード→再エンコードが一致
@@ -115,6 +115,12 @@ db.exec(`
 // conversations, notes に case_id カラム追加（マイグレーション）
 try { db.exec(`ALTER TABLE conversations ADD COLUMN case_id TEXT`); } catch {}
 try { db.exec(`ALTER TABLE notes ADD COLUMN case_id TEXT`); } catch {}
+
+// ─── Zepインスパイア: 時間軸 + エージェント別記憶（マイグレーション） ──
+try { db.exec(`ALTER TABLE notes ADD COLUMN valid_at TEXT`); } catch {}
+try { db.exec(`ALTER TABLE notes ADD COLUMN invalid_at TEXT`); } catch {}
+try { db.exec(`ALTER TABLE notes ADD COLUMN agent_id TEXT`); } catch {}
+try { db.exec(`ALTER TABLE conversations ADD COLUMN agent_id TEXT`); } catch {}
 
 // ─── ベクトルテーブル（オプション） ─────────────────────────────────
 db.exec(`
@@ -263,45 +269,77 @@ function initCaseLinks(type, id, caseId) {
   }
 }
 
-// 関連メモ取得（weight上位3件）
+// ─── グラフ探索（BFS多段ホップ） ────────────────────────────────
+function traverseGraph(startType, startId, maxDepth = 2, minWeight = 0.1) {
+  const visited = new Set([`${startType}:${startId}`]);
+  const results = [];
+  let frontier = [{ type: startType, id: startId, depth: 0, pathScore: 1.0, path: [] }];
+
+  const stmt = db.prepare(`
+    SELECT target_type, target_id, weight FROM memory_links
+    WHERE source_type=? AND source_id=? AND weight >= ?
+    ORDER BY weight DESC LIMIT 10
+  `);
+
+  for (let d = 0; d < maxDepth; d++) {
+    const nextFrontier = [];
+    for (const node of frontier) {
+      const links = stmt.all(node.type, node.id, minWeight);
+      for (const l of links) {
+        const k = `${l.target_type}:${l.target_id}`;
+        if (visited.has(k)) continue;
+        visited.add(k);
+        const pathScore = node.pathScore * l.weight;
+        const path = [...node.path, { type: node.type, id: node.id }];
+        const entry = { type: l.target_type, id: l.target_id, depth: d + 1, pathScore, path };
+        results.push(entry);
+        nextFrontier.push(entry);
+      }
+    }
+    frontier = nextFrontier;
+  }
+
+  results.sort((a, b) => b.pathScore - a.pathScore);
+  return results;
+}
+
+// 関連メモ取得（グラフ探索版、2ホップ、上位5件）
 function getRelatedMemories(results) {
   if (results.length === 0) return "";
   const seen = new Set(results.map(r => `${r.type}:${r.id}`));
-  const related = [];
-  const stmt = db.prepare(`
-    SELECT target_type, target_id, weight FROM memory_links
-    WHERE source_type=? AND source_id=?
-    ORDER BY weight DESC LIMIT 5
-  `);
+  const allRelated = [];
+
   for (const r of results) {
-    const links = stmt.all(r.type, r.id);
-    for (const l of links) {
-      const k = `${l.target_type}:${l.target_id}`;
+    const traversed = traverseGraph(r.type, r.id, 2, 0.05);
+    for (const t of traversed) {
+      const k = `${t.type}:${t.id}`;
       if (seen.has(k)) continue;
       seen.add(k);
-      related.push({ type: l.target_type, id: l.target_id, weight: l.weight });
+      allRelated.push(t);
     }
   }
-  related.sort((a, b) => b.weight - a.weight);
-  const top = related.slice(0, 3);
+
+  allRelated.sort((a, b) => b.pathScore - a.pathScore);
+  const top = allRelated.slice(0, 5);
   if (top.length === 0) return "";
 
   const lines = top.map(r => {
     let label = "";
+    const depthTag = r.depth > 1 ? ` depth:${r.depth}` : "";
     if (r.type === "note") {
-      const n = db.prepare(`SELECT key, content FROM notes WHERE id=?`).get(r.id);
+      const n = db.prepare(`SELECT key FROM notes WHERE id=?`).get(r.id);
       if (!n) return null;
-      label = `[メモ] id:${r.id} "${n.key ?? "(無題)"}" (w:${r.weight.toFixed(2)})`;
+      label = `[メモ] id:${r.id} "${n.key ?? "(無題)"}" (score:${r.pathScore.toFixed(3)}${depthTag})`;
     } else {
       const c = db.prepare(`SELECT title FROM conversations WHERE id=?`).get(r.id);
       if (!c) return null;
-      label = `[会話] id:${r.id} "${decrypt(c.title)}" (w:${r.weight.toFixed(2)})`;
+      label = `[会話] id:${r.id} "${decrypt(c.title)}" (score:${r.pathScore.toFixed(3)}${depthTag})`;
     }
     return label;
   }).filter(Boolean);
 
   if (lines.length === 0) return "";
-  return `\n\n🔗 関連メモ（ヘブ則）:\n${lines.join("\n")}`;
+  return `\n\n🔗 関連メモ（ヘブ則グラフ探索）:\n${lines.join("\n")}`;
 }
 
 // ─── ベクトル検索ヘルパー ───────────────────────────────────────
@@ -357,6 +395,7 @@ function loadPeersToken() {
   try { return readFileSync(PEERS_TOKEN_PATH, "utf-8").trim(); } catch { return null; }
 }
 
+// M7 fix: HTTP平文通信だが127.0.0.1(localhost)限定のため許容。外部通信には使用しない。
 function brokerPost(path, body) {
   return new Promise(resolve => {
     const token = loadPeersToken();
@@ -400,12 +439,14 @@ async function broadcastTopeers(content, tags) {
 
 // ─── FTS同期ヘルパー ────────────────────────────────────────────
 function syncConvFts(id, title, summary, content, tags) {
-  try { db.prepare(`DELETE FROM conversations_fts WHERE rowid=?`).run(id); } catch {}
+  // M3 fix: FTS DELETE失敗時にエラーログを出力
+  try { db.prepare(`DELETE FROM conversations_fts WHERE rowid=?`).run(id); } catch (e) { console.error(`[memory-mcp] FTS conv DELETE failed id:${id}`, e); }
   db.prepare(`INSERT INTO conversations_fts(rowid, title, summary, content, tags) VALUES(?,?,?,?,?)`)
     .run(id, title, summary ?? "", content, tags);
 }
 function syncNoteFts(id, key, content, tags) {
-  try { db.prepare(`DELETE FROM notes_fts WHERE rowid=?`).run(id); } catch {}
+  // M3 fix: FTS DELETE失敗時にエラーログを出力
+  try { db.prepare(`DELETE FROM notes_fts WHERE rowid=?`).run(id); } catch (e) { console.error(`[memory-mcp] FTS note DELETE failed id:${id}`, e); }
   db.prepare(`INSERT INTO notes_fts(rowid, key, content, tags) VALUES(?,?,?,?)`)
     .run(id, key ?? "", content, tags);
 }
@@ -448,20 +489,23 @@ server.tool("save_note",
     key:     z.string().optional().describe("Key for upsert / キー名(上書き用)"),
     tags:    z.array(z.string()).optional(),
     case_id: z.string().optional().describe("Case ID / 案件ID"),
+    valid_at: z.string().optional().describe("When this fact became valid (ISO date) / この事実が有効になった日時"),
   },
-  async ({ content, key, tags, case_id }) => {
+  async ({ content, key, tags, case_id, valid_at }) => {
     const t = autoProjectTag(tags ?? []);
     const tagsJson = JSON.stringify(t);
+    const vat = valid_at ?? new Date().toISOString().slice(0, 10);
     let id;
     if (key) {
-      db.prepare(`INSERT INTO notes(key,content,tags,case_id) VALUES(?,?,?,?)
+      db.prepare(`INSERT INTO notes(key,content,tags,case_id,valid_at) VALUES(?,?,?,?,?)
         ON CONFLICT(key) DO UPDATE SET content=excluded.content,tags=excluded.tags,
         case_id=COALESCE(excluded.case_id,case_id),
-        updated_at=datetime('now','localtime')`).run(key, encrypt(content), tagsJson, case_id ?? null);
+        valid_at=COALESCE(excluded.valid_at,valid_at),
+        updated_at=datetime('now','localtime')`).run(key, encrypt(content), tagsJson, case_id ?? null, vat);
       id = db.prepare("SELECT id FROM notes WHERE key=?").get(key)?.id;
     } else {
-      id = Number(db.prepare(`INSERT INTO notes(content,tags,case_id) VALUES(?,?,?)`)
-        .run(encrypt(content), tagsJson, case_id ?? null).lastInsertRowid);
+      id = Number(db.prepare(`INSERT INTO notes(content,tags,case_id,valid_at) VALUES(?,?,?,?)`)
+        .run(encrypt(content), tagsJson, case_id ?? null, vat).lastInsertRowid);
     }
     syncNoteFts(id, key, content, tagsJson);
     if (case_id) initCaseLinks("note", id, case_id);
@@ -496,69 +540,61 @@ server.tool("search_memory",
   {
     query:   z.string().describe("Keywords (space-separated AND) / キーワード(スペース区切りでAND)"),
     case_id: z.string().optional().describe("Filter by case ID / 案件IDで絞り込み"),
+    include_invalid: z.boolean().optional().default(false).describe("Include invalidated notes / 無効化されたメモも含める"),
+    agent_id: z.string().optional().describe("Filter by agent ID / エージェントIDで絞り込み"),
   },
-  ({ query, case_id }) => {
+  ({ query, case_id, include_invalid, agent_id }) => {
     const words = query.trim().split(/\s+/);
     const hasShortWord = words.some(w => [...w].length < 3);
-    let rows;
 
+    // 動的フィルタ構築
+    const noteFilters = [];
+    const noteParams = [];
+    const convFilters = [];
+    const convParams = [];
+    if (case_id) { noteFilters.push("n.case_id=?"); noteParams.push(case_id); convFilters.push("c.case_id=?"); convParams.push(case_id); }
+    if (agent_id) { noteFilters.push("n.agent_id=?"); noteParams.push(agent_id); convFilters.push("c.agent_id=?"); convParams.push(agent_id); }
+    if (!include_invalid) { noteFilters.push("n.invalid_at IS NULL"); }
+    const noteWhere = noteFilters.length ? " AND " + noteFilters.join(" AND ") : "";
+    const convWhere = convFilters.length ? " AND " + convFilters.join(" AND ") : "";
+
+    let rows;
     if (hasShortWord) {
-      // trigram FTS5は3文字未満を検索できないためLIKEフォールバック
       const likeClauses = words.map(() => "content LIKE ?").join(" AND ");
       const likeParams = words.map(w => `%${w}%`);
-      const caseFilter = case_id ? " AND c.case_id=?" : "";
-      const caseParams = case_id ? [case_id] : [];
       rows = db.prepare(`
         SELECT 'conversation' as type, c.id, c.title as key_enc,
-          '' as snip, c.created_at, c.case_id
-        FROM conversations_fts f
-        JOIN conversations c ON f.rowid=c.id
-        WHERE ${likeClauses.replace(/content/g, "f.content")}${caseFilter}
+          '' as snip, c.created_at, c.case_id, NULL as valid_at, NULL as invalid_at
+        FROM conversations_fts
+        JOIN conversations c ON conversations_fts.rowid=c.id
+        WHERE ${likeClauses.replace(/content/g, "conversations_fts.content")}${convWhere}
         UNION ALL
         SELECT 'note', n.id, n.key as key_enc,
-          '' as snip, n.created_at, n.case_id
-        FROM notes_fts f
-        JOIN notes n ON f.rowid=n.id
-        WHERE ${likeClauses.replace(/content/g, "f.content")}${caseFilter}
+          '' as snip, n.created_at, n.case_id, n.valid_at, n.invalid_at
+        FROM notes_fts
+        JOIN notes n ON notes_fts.rowid=n.id
+        WHERE ${likeClauses.replace(/content/g, "notes_fts.content")}${noteWhere}
         ORDER BY created_at DESC LIMIT 20
-      `).all(...likeParams, ...caseParams, ...likeParams, ...caseParams);
+      `).all(...likeParams, ...convParams, ...likeParams, ...noteParams);
     } else {
       const q = words.join(" AND ");
-      if (case_id) {
-        rows = db.prepare(`
-          SELECT 'conversation' as type, c.id, c.title as key_enc,
-            snippet(conversations_fts,2,'【','】','…',20) as snip, c.created_at, c.case_id
-          FROM conversations_fts f
-          JOIN conversations c ON f.rowid=c.id
-          WHERE f MATCH ? AND c.case_id=?
-          UNION ALL
-          SELECT 'note', n.id, n.key,
-            snippet(notes_fts,1,'【','】','…',20), n.created_at, n.case_id
-          FROM notes_fts f
-          JOIN notes n ON f.rowid=n.id
-          WHERE f MATCH ? AND n.case_id=?
-          ORDER BY created_at DESC LIMIT 20
-        `).all(q, case_id, q, case_id);
-      } else {
-        rows = db.prepare(`
-          SELECT 'conversation' as type, c.id, c.title as key_enc,
-            snippet(conversations_fts,2,'【','】','…',20) as snip, c.created_at, c.case_id
-          FROM conversations_fts f
-          JOIN conversations c ON f.rowid=c.id
-          WHERE f MATCH ?
-          UNION ALL
-          SELECT 'note', n.id, n.key as key_enc,
-            snippet(notes_fts,1,'【','】','…',20), n.created_at, n.case_id
-          FROM notes_fts f
-          JOIN notes n ON f.rowid=n.id
-          WHERE f MATCH ?
-          ORDER BY created_at DESC LIMIT 20
-        `).all(q, q);
-      }
+      rows = db.prepare(`
+        SELECT 'conversation' as type, c.id, c.title as key_enc,
+          snippet(conversations_fts,2,'【','】','…',20) as snip, c.created_at, c.case_id, NULL as valid_at, NULL as invalid_at
+        FROM conversations_fts
+        JOIN conversations c ON conversations_fts.rowid=c.id
+        WHERE conversations_fts MATCH ?${convWhere}
+        UNION ALL
+        SELECT 'note', n.id, n.key as key_enc,
+          snippet(notes_fts,1,'【','】','…',20), n.created_at, n.case_id, n.valid_at, n.invalid_at
+        FROM notes_fts
+        JOIN notes n ON notes_fts.rowid=n.id
+        WHERE notes_fts MATCH ?${noteWhere}
+        ORDER BY created_at DESC LIMIT 20
+      `).all(q, ...convParams, q, ...noteParams);
     }
     if (!rows.length) return { content: [{ type: "text", text: `「${query}」に一致するデータはありません。` }] };
 
-    // ヘブ則: 検索結果を記録
     const searchResults = rows.map(r => ({ type: r.type, id: r.id }));
     recordSearchResults(searchResults);
 
@@ -567,7 +603,10 @@ server.tool("search_memory",
         ? decrypt(r.key_enc) ?? "(不明)"
         : r.key_enc ?? "(無題)";
       const caseTag = r.case_id ? ` [案件:${r.case_id}]` : "";
-      return `[${r.type === "conversation" ? "会話" : "メモ"}] id:${r.id} "${label}"${caseTag}\n  ${r.snip}\n  ${r.created_at}`;
+      const temporal = r.valid_at
+        ? (r.invalid_at ? ` [無効: ${r.valid_at}〜${r.invalid_at}]` : ` [有効: ${r.valid_at}〜]`)
+        : "";
+      return `[${r.type === "conversation" ? "会話" : "メモ"}] id:${r.id} "${label}"${caseTag}${temporal}\n  ${r.snip}\n  ${r.created_at}`;
     }).join("\n\n");
 
     const related = getRelatedMemories(searchResults);
@@ -616,7 +655,8 @@ server.tool("delete_conversation",
   "Delete a conversation by ID. / 指定IDの会話を削除",
   { id: z.number().int() },
   ({ id }) => {
-    try { db.prepare(`DELETE FROM conversations_fts WHERE rowid=?`).run(id); } catch {}
+    // M3 fix: FTS DELETE失敗時にエラーログを出力
+    try { db.prepare(`DELETE FROM conversations_fts WHERE rowid=?`).run(id); } catch (e) { console.error(`[memory-mcp] FTS conv DELETE failed id:${id}`, e); }
     db.prepare(`DELETE FROM memory_links WHERE (source_type='conversation' AND source_id=?) OR (target_type='conversation' AND target_id=?)`).run(id, id);
     const info = db.prepare(`DELETE FROM conversations WHERE id=?`).run(id);
     return { content: [{ type: "text", text: info.changes > 0 ? `🗑 id:${id} 削除しました。` : `id:${id} は存在しません。` }] };
@@ -660,19 +700,57 @@ server.tool("save_case_note",
   }
 );
 
+// ─── invalidate_note（時間軸管理） ──────────────────────────────
+server.tool("invalidate_note",
+  "Mark a note as no longer valid (temporal invalidation). / メモを無効化（時間軸管理）。",
+  {
+    id:     z.number().int().optional().describe("Note ID / メモID"),
+    key:    z.string().optional().describe("Note key / メモのキー"),
+    reason: z.string().optional().describe("Reason for invalidation / 無効化の理由"),
+  },
+  async ({ id, key, reason }) => {
+    let noteId = id;
+    if (!noteId && key) {
+      const row = db.prepare(`SELECT id FROM notes WHERE key=?`).get(key);
+      if (!row) return { content: [{ type: "text", text: `key="${key}" は存在しません。` }] };
+      noteId = row.id;
+    }
+    if (!noteId) return { content: [{ type: "text", text: `id または key を指定してください。` }] };
+    const info = db.prepare(`UPDATE notes SET invalid_at=datetime('now','localtime'), updated_at=datetime('now','localtime') WHERE id=?`).run(noteId);
+    if (info.changes === 0) return { content: [{ type: "text", text: `id:${noteId} は存在しません。` }] };
+    // M4 fix: invalidation後にFTSとベクトルを同期
+    const updatedNote = db.prepare(`SELECT key, content, tags FROM notes WHERE id=?`).get(noteId);
+    if (updatedNote) {
+      syncNoteFts(noteId, updatedNote.key, decrypt(updatedNote.content) ?? "", updatedNote.tags);
+      await upsertVector("note", noteId, `${updatedNote.key ?? ""} ${decrypt(updatedNote.content) ?? ""}`.slice(0, 8000));
+    }
+    if (reason) {
+      db.prepare(`INSERT INTO notes(key,content,tags,valid_at) VALUES(?,?,?,datetime('now','localtime'))`)
+        .run(`invalidation-reason-${noteId}`, encrypt(`id:${noteId}の無効化理由: ${reason}`), "[]");
+    }
+    return { content: [{ type: "text", text: `⏰ id:${noteId} を無効化しました。${reason ? ` 理由: ${reason}` : ""}` }] };
+  }
+);
+
 server.tool("list_cases",
   "List registered cases. / 登録済み案件の一覧。",
   { include_archived: z.boolean().optional().default(false).describe("Include archived / アーカイブ済みも含める") },
   ({ include_archived }) => {
-    const q = include_archived
-      ? `SELECT * FROM cases ORDER BY updated_at DESC`
-      : `SELECT * FROM cases WHERE status='active' ORDER BY updated_at DESC`;
+    // M5 fix: N+1クエリをJOIN+サブクエリで一括取得
+    const statusFilter = include_archived ? "" : "WHERE c.status='active'";
+    const q = `
+      SELECT c.*,
+        COALESCE(n.cnt, 0) as noteCount,
+        COALESCE(cv.cnt, 0) as convCount
+      FROM cases c
+      LEFT JOIN (SELECT case_id, COUNT(*) as cnt FROM notes GROUP BY case_id) n ON n.case_id = c.case_id
+      LEFT JOIN (SELECT case_id, COUNT(*) as cnt FROM conversations GROUP BY case_id) cv ON cv.case_id = c.case_id
+      ${statusFilter}
+      ORDER BY c.updated_at DESC`;
     const rows = db.prepare(q).all();
     if (!rows.length) return { content: [{ type: "text", text: "登録済みの案件はありません。" }] };
     const text = rows.map(r => {
-      const noteCount = db.prepare(`SELECT COUNT(*) as c FROM notes WHERE case_id=?`).get(r.case_id).c;
-      const convCount = db.prepare(`SELECT COUNT(*) as c FROM conversations WHERE case_id=?`).get(r.case_id).c;
-      return `[${r.status}] ${r.case_id}: ${r.name} (メモ:${noteCount} 会話:${convCount}) ${r.updated_at}`;
+      return `[${r.status}] ${r.case_id}: ${r.name} (メモ:${r.noteCount} 会話:${r.convCount}) ${r.updated_at}`;
     }).join("\n");
     return { content: [{ type: "text", text: `📁 案件一覧 (${rows.length}件)\n\n${text}` }] };
   }
@@ -710,6 +788,59 @@ server.tool("archive_case",
   }
 );
 
+// ─── エージェント別記憶（swarm-protocol接続） ──────────────────
+server.tool("save_agent_memory",
+  "Save a memory for a specific agent (swarm worker/conductor). / エージェント別の記憶を保存（swarm worker/conductor用）。",
+  {
+    agent_id: z.string().describe("Agent ID (e.g. swarm-worker-1) / エージェントID"),
+    content:  z.string().describe("Memory content / 記憶内容"),
+    key:      z.string().optional().describe("Key for upsert / キー名"),
+    tags:     z.array(z.string()).optional(),
+    case_id:  z.string().optional().describe("Case ID / 案件ID"),
+  },
+  async ({ agent_id, content, key, tags, case_id }) => {
+    const t = autoProjectTag(tags ?? []);
+    t.push(`agent:${agent_id}`);
+    const tagsJson = JSON.stringify(t);
+    const vat = new Date().toISOString().slice(0, 10);
+    let id;
+    const effectiveKey = key ? `${agent_id}:${key}` : null;
+    if (effectiveKey) {
+      db.prepare(`INSERT INTO notes(key,content,tags,case_id,valid_at,agent_id) VALUES(?,?,?,?,?,?)
+        ON CONFLICT(key) DO UPDATE SET content=excluded.content,tags=excluded.tags,
+        case_id=COALESCE(excluded.case_id,case_id),agent_id=excluded.agent_id,
+        valid_at=COALESCE(excluded.valid_at,valid_at),
+        updated_at=datetime('now','localtime')`).run(effectiveKey, encrypt(content), tagsJson, case_id ?? null, vat, agent_id);
+      id = db.prepare("SELECT id FROM notes WHERE key=?").get(effectiveKey)?.id;
+    } else {
+      id = Number(db.prepare(`INSERT INTO notes(content,tags,case_id,valid_at,agent_id) VALUES(?,?,?,?,?)`)
+        .run(encrypt(content), tagsJson, case_id ?? null, vat, agent_id).lastInsertRowid);
+    }
+    syncNoteFts(id, effectiveKey, content, tagsJson);
+    if (case_id) initCaseLinks("note", id, case_id);
+    await upsertVector("note", id, `${effectiveKey ?? ""} ${content}`.slice(0, 8000));
+    return { content: [{ type: "text", text: `🤖 エージェント記憶保存 id:${id} agent:${agent_id}${effectiveKey ? ` key:${effectiveKey}` : ""}` }] };
+  }
+);
+
+server.tool("get_agent_context",
+  "Get all memories for a specific agent. / 特定エージェントの全記憶を取得。",
+  {
+    agent_id: z.string().describe("Agent ID / エージェントID"),
+    limit:    z.number().int().min(1).max(50).optional().default(10).describe("Max results / 最大件数"),
+  },
+  ({ agent_id, limit }) => {
+    const rows = db.prepare(`SELECT id, key, content, tags, valid_at, invalid_at, case_id, created_at
+      FROM notes WHERE agent_id=? ORDER BY created_at DESC LIMIT ?`).all(agent_id, limit);
+    if (!rows.length) return { content: [{ type: "text", text: `エージェント "${agent_id}" の記憶はありません。` }] };
+    const text = rows.map(r => {
+      const temporal = r.invalid_at ? `[無効: ${r.valid_at}〜${r.invalid_at}]` : `[有効: ${r.valid_at ?? "?"}〜]`;
+      return `id:${r.id} ${r.key ?? "(無題)"} ${temporal}\n  ${decrypt(r.content)?.slice(0, 100)}…`;
+    }).join("\n\n");
+    return { content: [{ type: "text", text: `🤖 エージェント "${agent_id}" の記憶 (${rows.length}件)\n\n${text}` }] };
+  }
+);
+
 // ─── rag_query（RAG: 検索→全文取得→文脈返却を一発で） ─────────
 server.tool("rag_query",
   "RAG search: hybrid keyword + vector search returning full context. Use when Claude needs past memories to answer. / RAG検索: キーワード+ベクトルで全文を文脈として返す。",
@@ -726,26 +857,27 @@ server.tool("rag_query",
     const hasShortWord = words.some(w => [...w].length < 3);
     let ftsRows;
     if (hasShortWord) {
-      const likeClauses = words.map(() => "f.content LIKE ?").join(" AND ");
+      const notesLike = words.map(() => "notes_fts.content LIKE ?").join(" AND ");
+      const convsLike = words.map(() => "conversations_fts.content LIKE ?").join(" AND ");
       const likeParams = words.map(w => "%" + w + "%");
       const caseFilter = case_id ? " AND t.case_id=?" : "";
       const caseParams = case_id ? [case_id] : [];
       ftsRows = db.prepare(
-        "SELECT 'note' as type, t.id FROM notes_fts f JOIN notes t ON f.rowid=t.id WHERE " + likeClauses + caseFilter +
-        " UNION ALL SELECT 'conversation', t.id FROM conversations_fts f JOIN conversations t ON f.rowid=t.id WHERE " +
-        likeClauses.replace(/f\.content/g, "f.content") + caseFilter + " LIMIT 20"
+        "SELECT 'note' as type, t.id FROM notes_fts JOIN notes t ON notes_fts.rowid=t.id WHERE " + notesLike + caseFilter +
+        " UNION ALL SELECT 'conversation', t.id FROM conversations_fts JOIN conversations t ON conversations_fts.rowid=t.id WHERE " +
+        convsLike + caseFilter + " LIMIT 20"
       ).all(...likeParams, ...caseParams, ...likeParams, ...caseParams);
     } else {
       const q = words.join(" AND ");
       if (case_id) {
         ftsRows = db.prepare(
-          "SELECT 'note' as type, t.id FROM notes_fts f JOIN notes t ON f.rowid=t.id WHERE f MATCH ? AND t.case_id=?" +
-          " UNION ALL SELECT 'conversation', t.id FROM conversations_fts f JOIN conversations t ON f.rowid=t.id WHERE f MATCH ? AND t.case_id=? LIMIT 20"
+          "SELECT 'note' as type, t.id FROM notes_fts JOIN notes t ON notes_fts.rowid=t.id WHERE notes_fts MATCH ? AND t.case_id=?" +
+          " UNION ALL SELECT 'conversation', t.id FROM conversations_fts JOIN conversations t ON conversations_fts.rowid=t.id WHERE conversations_fts MATCH ? AND t.case_id=? LIMIT 20"
         ).all(q, case_id, q, case_id);
       } else {
         ftsRows = db.prepare(
-          "SELECT 'note' as type, t.id FROM notes_fts f JOIN notes t ON f.rowid=t.id WHERE f MATCH ?" +
-          " UNION ALL SELECT 'conversation', t.id FROM conversations_fts f JOIN conversations t ON f.rowid=t.id WHERE f MATCH ? LIMIT 20"
+          "SELECT 'note' as type, t.id FROM notes_fts JOIN notes t ON notes_fts.rowid=t.id WHERE notes_fts MATCH ?" +
+          " UNION ALL SELECT 'conversation', t.id FROM conversations_fts JOIN conversations t ON conversations_fts.rowid=t.id WHERE conversations_fts MATCH ? LIMIT 20"
         ).all(q, q);
       }
     }
@@ -757,22 +889,27 @@ server.tool("rag_query",
     }
 
     // 2. ベクトル検索（有効時のみ）
+    // M1 fix: case_id指定時はWHERE句で絞り込み、未指定時はLIMIT 1000で全件フルスキャンを防止
     if (VECTOR_ENABLED) {
       const queryVec = await getEmbedding(query);
       if (queryVec) {
-        const allVecs = db.prepare("SELECT type, id, embedding FROM vectors").all();
-        const scored = allVecs.map(row => {
+        let vecRows;
+        if (case_id) {
+          vecRows = db.prepare(
+            `SELECT v.type, v.id, v.embedding FROM vectors v
+             WHERE (v.type='note' AND v.id IN (SELECT id FROM notes WHERE case_id=?))
+                OR (v.type='conversation' AND v.id IN (SELECT id FROM conversations WHERE case_id=?))`
+          ).all(case_id, case_id);
+        } else {
+          vecRows = db.prepare("SELECT type, id, embedding FROM vectors LIMIT 1000").all();
+        }
+        const scored = vecRows.map(row => {
           const vec = blobToVec(row.embedding);
           return { type: row.type, id: row.id, sim: cosineSimilarity(queryVec, vec) };
         });
         scored.sort((a, b) => b.sim - a.sim);
 
         for (const s of scored.slice(0, 20)) {
-          if (case_id) {
-            const table = s.type === "note" ? "notes" : "conversations";
-            const row = db.prepare("SELECT case_id FROM " + table + " WHERE id=?").get(s.id);
-            if (row?.case_id !== case_id) continue;
-          }
           const k = s.type + ":" + s.id;
           const existing = results.get(k);
           if (existing) {
@@ -851,12 +988,22 @@ server.tool("semantic_search",
       return { content: [{ type: "text", text: "⚠️ Embeddingの取得に失敗しました。" }] };
     }
 
-    const allVecs = db.prepare(`SELECT type, id, embedding FROM vectors`).all();
+    // M1 fix: case_id指定時はWHERE句でSQLiteレベルで絞り込み、未指定時はLIMIT 1000
+    let allVecs;
+    if (case_id) {
+      allVecs = db.prepare(
+        `SELECT v.type, v.id, v.embedding FROM vectors v
+         WHERE (v.type='note' AND v.id IN (SELECT id FROM notes WHERE case_id=?))
+            OR (v.type='conversation' AND v.id IN (SELECT id FROM conversations WHERE case_id=?))`
+      ).all(case_id, case_id);
+    } else {
+      allVecs = db.prepare(`SELECT type, id, embedding FROM vectors LIMIT 1000`).all();
+    }
     if (!allVecs.length) {
       return { content: [{ type: "text", text: "ベクトルデータがありません。メモを保存するとベクトルが自動生成されます。" }] };
     }
 
-    // コサイン類似度で全件スコアリング
+    // コサイン類似度でスコアリング
     const scored = allVecs.map(row => {
       const vec = blobToVec(row.embedding);
       const sim = cosineSimilarity(queryVec, vec);
@@ -864,17 +1011,8 @@ server.tool("semantic_search",
     });
     scored.sort((a, b) => b.similarity - a.similarity);
 
-    // case_idフィルタ適用 & 上位取得
-    const results = [];
-    for (const s of scored) {
-      if (results.length >= limit) break;
-      if (case_id) {
-        const table = s.type === "note" ? "notes" : "conversations";
-        const row = db.prepare(`SELECT case_id FROM ${table} WHERE id=?`).get(s.id);
-        if (row?.case_id !== case_id) continue;
-      }
-      results.push(s);
-    }
+    // 上位取得（case_idフィルタはSQL側で適用済み）
+    const results = scored.slice(0, limit);
 
     if (!results.length) {
       return { content: [{ type: "text", text: `「${query}」に類似するデータはありません。` }] };
@@ -939,6 +1077,36 @@ server.tool("get_memory_links",
   }
 );
 
+// ─── グラフ探索ツール ──────────────────────────────────────────
+server.tool("traverse_memory_graph",
+  "Traverse Hebbian memory graph (multi-hop BFS). / ヘブ則メモリグラフを多段探索（BFS）。",
+  {
+    type: z.enum(["note", "conversation"]).describe("Type / 種別"),
+    id:   z.number().int().describe("ID"),
+    max_depth:  z.number().int().min(1).max(4).optional().default(2).describe("Max hops / 最大ホップ数"),
+    min_weight: z.number().min(0).max(1).optional().default(0.1).describe("Min weight threshold / 最小重みしきい値"),
+  },
+  ({ type, id, max_depth, min_weight }) => {
+    const results = traverseGraph(type, id, max_depth, min_weight);
+    if (!results.length) return { content: [{ type: "text", text: `id:${id} (${type}) からのグラフ探索: リンクなし。` }] };
+
+    const lines = results.slice(0, 20).map(r => {
+      let label = "";
+      if (r.type === "note") {
+        const n = db.prepare(`SELECT key FROM notes WHERE id=?`).get(r.id);
+        label = n?.key ?? "(無題)";
+      } else {
+        const c = db.prepare(`SELECT title FROM conversations WHERE id=?`).get(r.id);
+        label = c ? decrypt(c.title) : "(不明)";
+      }
+      const pathStr = r.path.map(p => `${p.type}:${p.id}`).join(" → ");
+      return `  ${"  ".repeat(r.depth - 1)}→ [${r.type}] id:${r.id} "${label}" (score:${r.pathScore.toFixed(3)} depth:${r.depth})\n  ${"  ".repeat(r.depth - 1)}  path: ${pathStr} → ${r.type}:${r.id}`;
+    });
+
+    return { content: [{ type: "text", text: `🕸️ グラフ探索 (${type} id:${id}, depth:${max_depth})\n\n${lines.join("\n")}` }] };
+  }
+);
+
 server.tool("memory_stats",
   "Show memory statistics (counts, links, cases, vectors). / メモリMCPの統計情報",
   {},
@@ -950,18 +1118,25 @@ server.tool("memory_stats",
     const avgWeight = db.prepare(`SELECT AVG(weight) as a FROM memory_links`).get().a ?? 0;
     const strongLinks = db.prepare(`SELECT COUNT(*) as c FROM memory_links WHERE weight > 0.5`).get().c;
     const vecCount = db.prepare(`SELECT COUNT(*) as c FROM vectors`).get().c;
+    const invalidCount = db.prepare(`SELECT COUNT(*) as c FROM notes WHERE invalid_at IS NOT NULL`).get().c;
+    const temporalCount = db.prepare(`SELECT COUNT(*) as c FROM notes WHERE valid_at IS NOT NULL`).get().c;
+    const agentNotes = db.prepare(`SELECT agent_id, COUNT(*) as c FROM notes WHERE agent_id IS NOT NULL GROUP BY agent_id`).all();
+    const agentLine = agentNotes.length > 0
+      ? `  エージェント記憶: ${agentNotes.map(a => `${a.agent_id}(${a.c}件)`).join(", ")}`
+      : `  エージェント記憶: なし`;
     return {
       content: [{
         type: "text",
         text: [
-          `📊 Memory MCP Stats`,
-          `  メモ: ${noteCount}件`,
+          `📊 Memory MCP Stats (v3.0 Zep-inspired)`,
+          `  メモ: ${noteCount}件 (時間軸付き:${temporalCount} 無効:${invalidCount})`,
           `  会話: ${convCount}件`,
           `  案件: ${caseCount}件 (active)`,
           `  ヘブ則リンク: ${linkCount}件 (avg_w: ${avgWeight.toFixed(3)}, strong>0.5: ${strongLinks}件)`,
+          agentLine,
           `  ベクトル: ${vecCount}件 ${VECTOR_ENABLED ? `✅ (${EMBEDDING_MODEL})` : "⚠️ 無効 (EMBEDDING_API_KEY未設定)"}`,
           `  DB: ${DB_PATH}`,
-          `  暗号化: AES-256-GCM ✅`,
+          `  暗号化: AES-256-GCM ✅ (注: FTSインデックスは検索のため平文保存)`, // M2 fix: FTS平文である旨を追記
         ].join("\n"),
       }],
     };
@@ -1002,7 +1177,8 @@ server.tool("export_memory",
           lines.push("- Created: " + n.created_at);
           lines.push("- Tags: " + (n.tags ?? "[]"));
           lines.push("");
-          lines.push(decrypt(n.content) ?? "");
+          // M6 fix: decrypt()がnull返却時に"[decryption failed]"に置換
+          lines.push(decrypt(n.content) ?? "[decryption failed]");
           lines.push("");
           lines.push("---");
           lines.push("");
@@ -1031,7 +1207,8 @@ server.tool("export_memory",
             lines.push("- Summary: " + summaryStr);
           }
           lines.push("");
-          lines.push(decrypt(c.content) ?? "");
+          // M6 fix: decrypt()がnull返却時に"[decryption failed]"に置換
+          lines.push(decrypt(c.content) ?? "[decryption failed]");
           lines.push("");
           lines.push("---");
           lines.push("");
@@ -1049,6 +1226,95 @@ server.tool("export_memory",
         text: "📄 Exported to " + outPath + " (" + noteCount + " notes, " + convCount + " conversations, " + (md.length / 1024).toFixed(1) + "KB)",
       }],
     };
+  }
+);
+
+// ─── context_gauge（セッション残量推定） ────────────────────────
+server.tool("context_gauge",
+  "Estimate remaining context window from hook-logged tool usage. / フックで記録したツール使用量からコンテキスト残量を推定。",
+  {
+    session_id: z.string().optional().describe("Session ID to check. If omitted, uses most recent session."),
+    context_limit: z.number().optional().default(1_000_000).describe("Context window size in tokens (default: 1M)"),
+  },
+  ({ session_id, context_limit }) => {
+    const gaugePath = join(homedir(), ".claude", "context-gauge.jsonl");
+    if (!existsSync(gaugePath)) {
+      return { content: [{ type: "text", text: "No context-gauge data yet. Hook may not have fired." }] };
+    }
+
+    const lines = readFileSync(gaugePath, "utf-8").trim().split("\n").filter(Boolean);
+    const entries = [];
+    for (const line of lines) {
+      try { entries.push(JSON.parse(line)); } catch {}
+    }
+
+    if (entries.length === 0) {
+      return { content: [{ type: "text", text: "context-gauge.jsonl is empty." }] };
+    }
+
+    // Find target session
+    let sid = session_id;
+    if (!sid) {
+      // Use most recent session
+      const latest = entries[entries.length - 1];
+      sid = latest.sid;
+    }
+
+    const sessionEntries = entries.filter(e => e.sid === sid);
+    if (sessionEntries.length === 0) {
+      return { content: [{ type: "text", text: `No data for session ${sid}` }] };
+    }
+
+    // Accumulate
+    let totalTokens = 0;
+    let totalInputChars = 0;
+    let totalOutputChars = 0;
+    const toolCounts = {};
+    for (const e of sessionEntries) {
+      totalTokens += e.est_tk || 0;
+      totalInputChars += e.in_c || 0;
+      totalOutputChars += e.out_c || 0;
+      toolCounts[e.tool] = (toolCounts[e.tool] || 0) + 1;
+    }
+
+    // Add overhead estimate: user prompts + assistant text not captured by tool hooks
+    // Heuristic: tool I/O is ~60% of total context, multiply by 1.67
+    const estimatedTotal = Math.ceil(totalTokens * 1.67);
+    const remaining = Math.max(0, context_limit - estimatedTotal);
+    const usedPct = ((estimatedTotal / context_limit) * 100).toFixed(1);
+    const remainPct = ((remaining / context_limit) * 100).toFixed(1);
+
+    // Top tools by count
+    const topTools = Object.entries(toolCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([t, c]) => `${t}: ${c}`)
+      .join(", ");
+
+    const fmt = (n) => n.toLocaleString();
+    const elapsed = sessionEntries.length > 0
+      ? Math.round((sessionEntries[sessionEntries.length - 1].ts - sessionEntries[0].ts) / 60000)
+      : 0;
+
+    const text = [
+      `📊 Context Gauge — ${fmt(estimatedTotal)} / ${fmt(context_limit)} tk (${usedPct}%)`,
+      `   残り約 ${fmt(remaining)} tk (${remainPct}%)`,
+      ``,
+      `   Tool calls:   ${sessionEntries.length}`,
+      `   Input chars:  ${fmt(totalInputChars)}`,
+      `   Output chars: ${fmt(totalOutputChars)}`,
+      `   Raw tool tk:  ${fmt(totalTokens)} (×1.67 overhead = ${fmt(estimatedTotal)})`,
+      `   Elapsed:      ${elapsed} min`,
+      `   Top tools:    ${topTools}`,
+    ];
+
+    if (estimatedTotal > context_limit * 0.75) {
+      text.push(``, `⚠ 75%超過 — 大きな作業は避けること`);
+    } else if (estimatedTotal > context_limit * 0.50) {
+      text.push(``, `⚡ 50%超過 — 残量に注意`);
+    }
+
+    return { content: [{ type: "text", text: text.join("\n") }] };
   }
 );
 
