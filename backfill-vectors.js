@@ -6,7 +6,7 @@ import { join } from "path";
 import { readFileSync, existsSync } from "fs";
 import { createDecipheriv } from "node:crypto";
 
-const DATA_DIR = join(homedir(), ".memory-mcp");
+const DATA_DIR = process.env.MEMORY_MCP_DIR ?? join(homedir(), ".memory-mcp");
 const DB_PATH = join(DATA_DIR, "memory.db");
 const KEY_PATH = join(DATA_DIR, ".key");
 
@@ -35,16 +35,18 @@ function vecToBlob(vec) {
   return Buffer.from(new Float32Array(vec).buffer);
 }
 
-async function getEmbedding(text) {
+async function getEmbedding(text, maxLen = 8000) {
   const res = await fetch(EMBEDDING_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${EMBEDDING_API_KEY}`,
     },
-    body: JSON.stringify({ model: EMBEDDING_MODEL, input: text.slice(0, 8000) }),
+    body: JSON.stringify({ model: EMBEDDING_MODEL, input: text.slice(0, maxLen) }),
   });
   if (!res.ok) {
+    // CJK長文はコンテキスト超過(400)になり得るため短縮して再試行
+    if (maxLen > 2000) return getEmbedding(text, 2000);
     console.error(`  ✗ API error: ${res.status}`);
     return null;
   }

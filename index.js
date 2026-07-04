@@ -5,21 +5,35 @@ import { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import { homedir } from "os";
 import { join, basename } from "path";
-import { mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from "fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync, statSync } from "fs";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { request } from "node:http";
 
 // ─── データディレクトリ & 暗号鍵 ───────────────────────────────────
-const DATA_DIR = join(homedir(), ".memory-mcp");
+// MEMORY_MCP_DIR: テスト・別DB運用用の上書き（未設定なら ~/.memory-mcp）
+const DATA_DIR = process.env.MEMORY_MCP_DIR ?? join(homedir(), ".memory-mcp");
 mkdirSync(DATA_DIR, { recursive: true });
 const DB_PATH = join(DATA_DIR, "memory.db");
 const KEY_PATH = join(DATA_DIR, ".key");
+const CONFIG_PATH = join(DATA_DIR, "config.json");
 
-// ─── ベクトル検索設定（オプション） ─────────────────────────────────
-const EMBEDDING_API_KEY = process.env.EMBEDDING_API_KEY ?? process.env.OPENAI_API_KEY ?? null;
-const EMBEDDING_URL = process.env.EMBEDDING_URL ?? "https://api.openai.com/v1/embeddings";
-const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL ?? "text-embedding-3-small";
+// ─── ベクトル検索設定 ───────────────────────────────────────────
+// 解決順: env > ~/.memory-mcp/config.json > ローカルollama既定。
+// ホスト（Claude Desktop等）がenvを渡さず起動しても埋め込みが有効になる。
+// ollama不在でも getEmbedding が即null → 保存・検索は劣化なしで続行。
+let fileConfig = {};
+try { fileConfig = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")); } catch {}
+const EMBEDDING_API_KEY = process.env.EMBEDDING_API_KEY ?? process.env.OPENAI_API_KEY
+  ?? fileConfig.embedding_api_key ?? "ollama";
+const EMBEDDING_URL = process.env.EMBEDDING_URL ?? fileConfig.embedding_url
+  ?? "http://localhost:11434/v1/embeddings";
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL ?? fileConfig.embedding_model
+  ?? "nomic-embed-text";
 const VECTOR_ENABLED = !!EMBEDDING_API_KEY;
+// エンドポイント可用性: unknown | ok | down。down後はクールダウンを置いて再試行。
+let embeddingHealth = "unknown";
+let embeddingDownSince = 0;
+const EMBEDDING_RETRY_MS = 5 * 60 * 1000;
 
 function loadOrCreateKey() {
   if (existsSync(KEY_PATH)) {
@@ -75,6 +89,18 @@ const db = new DatabaseSync(DB_PATH);
 db.exec(`PRAGMA journal_mode = WAL`);
 db.exec(`PRAGMA busy_timeout = 30000`);
 
+// FTSは平文格納のためDBファイル自体を所有者のみ読書き可に絞る
+for (const p of [DB_PATH, DB_PATH + "-wal", DB_PATH + "-shm"]) {
+  try { chmodSync(p, 0o600); } catch {}
+}
+
+// ─── metaテーブル（起動時処理のゲーティング・プロセス跨ぎ状態） ───
+db.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`);
+const metaGet = (k) => db.prepare(`SELECT value FROM meta WHERE key=?`).get(k)?.value;
+const metaSet = (k, v) => db.prepare(
+  `INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`
+).run(k, String(v));
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,6 +141,8 @@ db.exec(`
 // conversations, notes に case_id カラム追加（マイグレーション）
 try { db.exec(`ALTER TABLE conversations ADD COLUMN case_id TEXT`); } catch {}
 try { db.exec(`ALTER TABLE notes ADD COLUMN case_id TEXT`); } catch {}
+// cases に統合先カラム追加（merge_cases のリダイレクト用）
+try { db.exec(`ALTER TABLE cases ADD COLUMN merged_into TEXT`); } catch {}
 
 // ─── Zepインスパイア: 時間軸 + エージェント別記憶（マイグレーション） ──
 try { db.exec(`ALTER TABLE notes ADD COLUMN valid_at TEXT`); } catch {}
@@ -171,9 +199,13 @@ function migrateEncryption() {
     }
   }
 }
-migrateEncryption();
+// 全行スキャンは初回のみ（以降の書き込みは常に暗号化されるため再走査不要）
+if (metaGet("enc_migrated") !== "1") {
+  migrateEncryption();
+  metaSet("enc_migrated", "1");
+}
 
-// ─── FTSリビルド（起動時） ──────────────────────────────────────
+// ─── FTSリビルド（必要時のみ） ──────────────────────────────────
 function rebuildFts() {
   db.exec(`DELETE FROM conversations_fts`);
   const convs = db.prepare(`SELECT id, title, summary, content, tags FROM conversations`).all();
@@ -188,16 +220,43 @@ function rebuildFts() {
     insertNoteFts.run(n.id, n.key ?? "", decrypt(n.content), n.tags ?? "[]");
   }
 }
-rebuildFts();
+// 毎起動の全リビルドをやめ、行数不整合かスキーマ版更新時のみ実施
+// （書き込みは都度syncNoteFts/syncConvFtsで同期されるため通常は一致する）
+const FTS_SCHEMA_V = "v31-trigram";
+{
+  const nCnt = db.prepare(`SELECT COUNT(*) c FROM notes`).get().c;
+  const nFts = db.prepare(`SELECT COUNT(*) c FROM notes_fts`).get().c;
+  const cCnt = db.prepare(`SELECT COUNT(*) c FROM conversations`).get().c;
+  const cFts = db.prepare(`SELECT COUNT(*) c FROM conversations_fts`).get().c;
+  if (nCnt !== nFts || cCnt !== cFts || metaGet("fts_schema_v") !== FTS_SCHEMA_V) {
+    rebuildFts();
+    metaSet("fts_schema_v", FTS_SCHEMA_V);
+  }
+}
 
-// ─── ヘブ則: 起動時減衰処理 ─────────────────────────────────────
-db.exec(`
-  UPDATE memory_links
-  SET weight = weight * 0.95
-  WHERE last_accessed < datetime('now', 'localtime', '-30 days')
-`);
-// 極小weightを削除
-db.exec(`DELETE FROM memory_links WHERE weight < 0.01`);
+// ─── ヘブ則: 減衰処理（1日1回まで） ─────────────────────────────
+// 旧実装はサーバ起動のたびに減衰しており、セッション多起動環境では
+// リンクが育つ前に消滅していた（strong>0.5が常に0件の原因）。
+{
+  const today = new Date().toISOString().slice(0, 10);
+  if (metaGet("last_decay") !== today) {
+    db.exec(`
+      UPDATE memory_links
+      SET weight = weight * 0.95
+      WHERE last_accessed < datetime('now', 'localtime', '-30 days')
+    `);
+    db.exec(`DELETE FROM memory_links WHERE weight < 0.01`);
+    // 削除済み行を指すベクトル・リンクの孤児掃除も日次でまとめて実施
+    db.exec(`DELETE FROM vectors WHERE (type='note' AND id NOT IN (SELECT id FROM notes))
+      OR (type='conversation' AND id NOT IN (SELECT id FROM conversations))`);
+    db.exec(`DELETE FROM memory_links WHERE
+      (source_type='note' AND source_id NOT IN (SELECT id FROM notes))
+      OR (source_type='conversation' AND source_id NOT IN (SELECT id FROM conversations))
+      OR (target_type='note' AND target_id NOT IN (SELECT id FROM notes))
+      OR (target_type='conversation' AND target_id NOT IN (SELECT id FROM conversations))`);
+    metaSet("last_decay", today);
+  }
+}
 
 // ─── プロジェクト自動タグ（feature 3） ──────────────────────────
 function autoProjectTag(tags) {
@@ -213,20 +272,49 @@ function autoProjectTag(tags) {
   return tags;
 }
 
+// ─── 案件ID解決（統合済みIDを統合先へ辿る） ─────────────────────
+// 統合後に旧IDで保存・検索されても迷子にならないようにする。
+function resolveCaseId(caseId) {
+  if (!caseId) return caseId;
+  let cur = caseId;
+  for (let i = 0; i < 5; i++) {
+    const row = db.prepare(`SELECT merged_into FROM cases WHERE case_id=?`).get(cur);
+    if (!row?.merged_into || row.merged_into === cur) return cur;
+    cur = row.merged_into;
+  }
+  return cur;
+}
+
 // ─── ヘブ則: 検索履歴トラッカー ─────────────────────────────────
-let lastSearchResults = [];
-let lastSearchTime = 0;
+// 履歴はmetaテーブルに永続化する。旧実装はプロセス内変数のみだったため、
+// セッション（=プロセス）を跨ぐと共起学習がゼロになっていた。
+function loadLastSearch() {
+  try {
+    const v = JSON.parse(metaGet("last_search") ?? "null");
+    if (v && Array.isArray(v.results)) return v;
+  } catch {}
+  return null;
+}
 
 function recordSearchResults(results) {
   const now = Date.now();
-  const prev = lastSearchResults;
-  const prevTime = lastSearchTime;
-  lastSearchResults = results;
-  lastSearchTime = now;
+  const prev = loadLastSearch();
 
-  // 5分以内の連続検索 → リンク強化
-  if (prev.length > 0 && (now - prevTime) < 5 * 60 * 1000) {
-    strengthenLinks(prev, results);
+  // 同一検索内の共起（上位5件同士）: 同じ問いに一緒に答えた記憶を関連づける
+  strengthenLinks(results.slice(0, 5), results.slice(0, 5));
+
+  // 5分以内の連続検索 → 前回結果と今回結果のリンク強化（プロセス跨ぎ対応）
+  if (prev && prev.results.length > 0 && (now - prev.ts) < 5 * 60 * 1000) {
+    strengthenLinks(prev.results.slice(0, 5), results.slice(0, 5));
+  }
+  metaSet("last_search", JSON.stringify({ ts: now, results: results.slice(0, 10) }));
+}
+
+// 検索→個別取得（get_conversation等）の流れを「有用だった」シグナルとして強化
+function recordAccess(type, id) {
+  const prev = loadLastSearch();
+  if (prev && (Date.now() - prev.ts) < 10 * 60 * 1000) {
+    strengthenLinks(prev.results.slice(0, 5), [{ type, id }]);
   }
 }
 
@@ -327,8 +415,8 @@ function getRelatedMemories(results) {
     let label = "";
     const depthTag = r.depth > 1 ? ` depth:${r.depth}` : "";
     if (r.type === "note") {
-      const n = db.prepare(`SELECT key FROM notes WHERE id=?`).get(r.id);
-      if (!n) return null;
+      const n = db.prepare(`SELECT key, invalid_at FROM notes WHERE id=?`).get(r.id);
+      if (!n || n.invalid_at) return null; // 無効化済みメモは関連候補から除外
       label = `[メモ] id:${r.id} "${n.key ?? "(無題)"}" (score:${r.pathScore.toFixed(3)}${depthTag})`;
     } else {
       const c = db.prepare(`SELECT title FROM conversations WHERE id=?`).get(r.id);
@@ -343,8 +431,12 @@ function getRelatedMemories(results) {
 }
 
 // ─── ベクトル検索ヘルパー ───────────────────────────────────────
-async function getEmbedding(text) {
+async function getEmbedding(text, timeoutMs = 10000) {
   if (!VECTOR_ENABLED) return null;
+  // エンドポイント停止中はクールダウンを置いて再試行（毎回の接続待ちを防ぐ）
+  if (embeddingHealth === "down" && Date.now() - embeddingDownSince < EMBEDDING_RETRY_MS) {
+    return null;
+  }
   try {
     const res = await fetch(EMBEDDING_URL, {
       method: "POST",
@@ -353,11 +445,21 @@ async function getEmbedding(text) {
         "Authorization": `Bearer ${EMBEDDING_API_KEY}`,
       },
       body: JSON.stringify({ model: EMBEDDING_MODEL, input: text }),
+      signal: AbortSignal.timeout(timeoutMs),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      // 4xx(入力長超過等)はエンドポイント自体は生きているのでdown扱いにしない
+      if (res.status >= 500) { embeddingHealth = "down"; embeddingDownSince = Date.now(); }
+      return null;
+    }
     const json = await res.json();
-    return json.data?.[0]?.embedding ?? null;
-  } catch { return null; }
+    const vec = json.data?.[0]?.embedding ?? null;
+    if (vec) embeddingHealth = "ok";
+    return vec;
+  } catch {
+    embeddingHealth = "down"; embeddingDownSince = Date.now();
+    return null;
+  }
 }
 
 function vecToBlob(vec) {
@@ -380,7 +482,9 @@ function cosineSimilarity(a, b) {
 
 async function upsertVector(type, id, text) {
   if (!VECTOR_ENABLED) return;
-  const vec = await getEmbedding(text);
+  let vec = await getEmbedding(text);
+  // CJK長文は埋め込みモデルのコンテキスト超過(400)になり得るため短縮して再試行
+  if (!vec && text.length > 2000) vec = await getEmbedding(text.slice(0, 2000));
   if (!vec) return;
   db.prepare(`INSERT INTO vectors(type, id, embedding, model) VALUES(?,?,?,?)
     ON CONFLICT(type, id) DO UPDATE SET embedding=excluded.embedding, model=excluded.model,
@@ -454,7 +558,7 @@ function syncNoteFts(id, key, content, tags) {
 // ═══════════════════════════════════════════════════════════════
 // MCPサーバー
 // ═══════════════════════════════════════════════════════════════
-const server = new McpServer({ name: "memory-mcp", version: "2.0.0" });
+const server = new McpServer({ name: "memory-mcp", version: "3.1.0" });
 
 // ─── save_conversation ──────────────────────────────────────────
 server.tool("save_conversation",
@@ -468,6 +572,7 @@ server.tool("save_conversation",
     case_id: z.string().optional().describe("Case ID / 案件ID"),
   },
   async ({ title, content, summary, tags, source, case_id }) => {
+    case_id = resolveCaseId(case_id);
     const t = autoProjectTag(tags ?? []);
     const tagsJson = JSON.stringify(t);
     const r = db.prepare(
@@ -492,6 +597,7 @@ server.tool("save_note",
     valid_at: z.string().optional().describe("When this fact became valid (ISO date) / この事実が有効になった日時"),
   },
   async ({ content, key, tags, case_id, valid_at }) => {
+    case_id = resolveCaseId(case_id);
     const t = autoProjectTag(tags ?? []);
     const tagsJson = JSON.stringify(t);
     const vat = valid_at ?? new Date().toISOString().slice(0, 10);
@@ -538,9 +644,9 @@ server.tool("broadcast_note",
 // FTS5 は bareword 中の - : * 等を列フィルタ/演算子として解釈するため、
 // 各語をフレーズクォートしてリテラル化する（"project-layout" 等で必須）。
 // tokenize='trigram' ではクォートしてもヒット集合は不変。
-function buildFtsQuery(words) {
+function buildFtsQuery(words, op = " AND ") {
   return words.map(w => w.replace(/\*+$/, "")).filter(Boolean)
-              .map(w => `"${w.replaceAll('"', '""')}"`).join(" AND ");
+              .map(w => `"${w.replaceAll('"', '""')}"`).join(op);
 }
 // LIKE分岐用: % _ \ のワイルドカード解釈を防ぐ（LIKE ? ESCAPE '\' とペアで使う）
 function escapeLike(w) {
@@ -557,7 +663,9 @@ server.tool("search_memory",
     agent_id: z.string().optional().describe("Filter by agent ID / エージェントIDで絞り込み"),
   },
   ({ query, case_id, include_invalid, agent_id }) => {
-    const words = query.trim().split(/\s+/);
+    case_id = resolveCaseId(case_id);
+    const words = query.trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return { content: [{ type: "text", text: "検索語を指定してください。" }] };
     const hasShortWord = words.some(w => [...w].length < 3);
 
     // 動的フィルタ構築
@@ -571,41 +679,57 @@ server.tool("search_memory",
     const noteWhere = noteFilters.length ? " AND " + noteFilters.join(" AND ") : "";
     const convWhere = convFilters.length ? " AND " + convFilters.join(" AND ") : "";
 
-    let rows;
-    if (hasShortWord) {
-      const likeClauses = words.map(() => "content LIKE ? ESCAPE '\\'").join(" AND ");
-      const likeParams = words.map(w => `%${escapeLike(w)}%`);
-      rows = db.prepare(`
-        SELECT 'conversation' as type, c.id, c.title as key_enc,
+    // 短語(3文字未満)はtrigram FTSで引けないためLIKEで全列(タイトル/キー/タグ含む)を見る。
+    // 旧実装はcontent列しか見ておらず「保釈」「認証」等の2文字クエリがタイトル一致を取り零していた。
+    const runLike = (joiner) => {
+      const convCols = ["title", "summary", "content", "tags"];
+      const noteCols = ["key", "content", "tags"];
+      const clause = (table, cols) => words.map(() =>
+        "(" + cols.map(col => `${table}.${col} LIKE ? ESCAPE '\\'`).join(" OR ") + ")"
+      ).join(joiner);
+      const paramsFor = (cols) => words.flatMap(w => cols.map(() => `%${escapeLike(w)}%`));
+      return db.prepare(`
+        SELECT 'conversation' as type, c.id, c.title as key_enc, c.summary as body_enc,
           '' as snip, c.created_at, c.case_id, NULL as valid_at, NULL as invalid_at
         FROM conversations_fts
         JOIN conversations c ON conversations_fts.rowid=c.id
-        WHERE ${likeClauses.replace(/content/g, "conversations_fts.content")}${convWhere}
+        WHERE (${clause("conversations_fts", convCols)})${convWhere}
         UNION ALL
-        SELECT 'note', n.id, n.key as key_enc,
+        SELECT 'note', n.id, n.key as key_enc, n.content as body_enc,
           '' as snip, n.created_at, n.case_id, n.valid_at, n.invalid_at
         FROM notes_fts
         JOIN notes n ON notes_fts.rowid=n.id
-        WHERE ${likeClauses.replace(/content/g, "notes_fts.content")}${noteWhere}
+        WHERE (${clause("notes_fts", noteCols)})${noteWhere}
         ORDER BY created_at DESC LIMIT 20
-      `).all(...likeParams, ...convParams, ...likeParams, ...noteParams);
-    } else {
-      const q = buildFtsQuery(words);
-      if (!q) return { content: [{ type: "text", text: `「${query}」に一致するデータはありません。` }] };
-      rows = db.prepare(`
-        SELECT 'conversation' as type, c.id, c.title as key_enc,
-          snippet(conversations_fts,2,'【','】','…',20) as snip, c.created_at, c.case_id, NULL as valid_at, NULL as invalid_at
+      `).all(...paramsFor(convCols), ...convParams, ...paramsFor(noteCols), ...noteParams);
+    };
+    // FTS経路: bm25(rank)の関連度順で返す（旧実装は作成日時順で関連度無視だった）
+    const runFts = (op) => {
+      const q = buildFtsQuery(words, op);
+      if (!q) return [];
+      return db.prepare(`
+        SELECT 'conversation' as type, c.id, c.title as key_enc, NULL as body_enc,
+          snippet(conversations_fts,2,'【','】','…',60) as snip, c.created_at, c.case_id,
+          NULL as valid_at, NULL as invalid_at, rank as rnk
         FROM conversations_fts
         JOIN conversations c ON conversations_fts.rowid=c.id
         WHERE conversations_fts MATCH ?${convWhere}
         UNION ALL
-        SELECT 'note', n.id, n.key as key_enc,
-          snippet(notes_fts,1,'【','】','…',20), n.created_at, n.case_id, n.valid_at, n.invalid_at
+        SELECT 'note', n.id, n.key as key_enc, NULL as body_enc,
+          snippet(notes_fts,1,'【','】','…',60), n.created_at, n.case_id, n.valid_at, n.invalid_at, rank as rnk
         FROM notes_fts
         JOIN notes n ON notes_fts.rowid=n.id
         WHERE notes_fts MATCH ?${noteWhere}
-        ORDER BY created_at DESC LIMIT 20
+        ORDER BY rnk LIMIT 20
       `).all(q, ...convParams, q, ...noteParams);
+    };
+
+    // 全語AND → 0件なら OR に段階緩和（複数語の共起問題対策）
+    let relaxed = false;
+    let rows = hasShortWord ? runLike(" AND ") : runFts(" AND ");
+    if (!rows.length && words.length > 1) {
+      rows = hasShortWord ? runLike(" OR ") : runFts(" OR ");
+      relaxed = true;
     }
     if (!rows.length) return { content: [{ type: "text", text: `「${query}」に一致するデータはありません。` }] };
 
@@ -620,11 +744,16 @@ server.tool("search_memory",
       const temporal = r.valid_at
         ? (r.invalid_at ? ` [無効: ${r.valid_at}〜${r.invalid_at}]` : ` [有効: ${r.valid_at}〜]`)
         : "";
-      return `[${r.type === "conversation" ? "会話" : "メモ"}] id:${r.id} "${label}"${caseTag}${temporal}\n  ${r.snip}\n  ${r.created_at}`;
+      // LIKE経路はsnippetが無いので本文冒頭をプレビューとして復号表示
+      const snip = r.snip || (r.body_enc
+        ? (decrypt(r.body_enc) ?? "").replace(/\s+/g, " ").slice(0, 80) + "…"
+        : "");
+      return `[${r.type === "conversation" ? "会話" : "メモ"}] id:${r.id} "${label}"${caseTag}${temporal}\n  ${snip}\n  ${r.created_at}`;
     }).join("\n\n");
 
     const related = getRelatedMemories(searchResults);
-    return { content: [{ type: "text", text: `🔍 ${rows.length}件\n\n${text}${related}` }] };
+    const header = `🔍 ${rows.length}件${relaxed ? "（全語AND一致なし→ORに緩和）" : ""}`;
+    return { content: [{ type: "text", text: `${header}\n\n${text}${related}` }] };
   }
 );
 
@@ -654,6 +783,7 @@ server.tool("get_conversation",
   ({ id }) => {
     const row = db.prepare(`SELECT * FROM conversations WHERE id=?`).get(id);
     if (!row) return { content: [{ type: "text", text: `id:${id} は存在しません。` }] };
+    recordAccess("conversation", id); // 検索→取得の流れをヘブ則強化シグナルにする
     const caseTag = row.case_id ? `\n案件: ${row.case_id}` : "";
     return {
       content: [{
@@ -672,6 +802,7 @@ server.tool("delete_conversation",
     // M3 fix: FTS DELETE失敗時にエラーログを出力
     try { db.prepare(`DELETE FROM conversations_fts WHERE rowid=?`).run(id); } catch (e) { console.error(`[memory-mcp] FTS conv DELETE failed id:${id}`, e); }
     db.prepare(`DELETE FROM memory_links WHERE (source_type='conversation' AND source_id=?) OR (target_type='conversation' AND target_id=?)`).run(id, id);
+    db.prepare(`DELETE FROM vectors WHERE type='conversation' AND id=?`).run(id);
     const info = db.prepare(`DELETE FROM conversations WHERE id=?`).run(id);
     return { content: [{ type: "text", text: info.changes > 0 ? `🗑 id:${id} 削除しました。` : `id:${id} は存在しません。` }] };
   }
@@ -688,11 +819,29 @@ server.tool("save_case_note",
     tags:    z.array(z.string()).optional(),
   },
   async ({ case_id, case_name, content, key, tags }) => {
-    // 案件自動登録
+    // 統合済み案件への保存は統合先へ自動転送（旧IDの黙殺防止）
+    const requestedId = case_id;
+    case_id = resolveCaseId(case_id);
+    const redirectNote = case_id !== requestedId
+      ? `\n↪ "${requestedId}" は統合済みのため "${case_id}" に保存しました` : "";
+    // 案件自動登録（case-a / case_a / case-a-2026 のような類似IDの分裂を防止）
     const existing = db.prepare(`SELECT case_id FROM cases WHERE case_id=?`).get(case_id);
+    let similarWarn = "";
     if (!existing) {
+      const norm = (s) => (s ?? "").toLowerCase().replace(/[-_\s]/g, "");
+      const nid = norm(case_id);
+      const similar = db.prepare(`SELECT case_id, name FROM cases`).all()
+        .filter(c => {
+          const m = norm(c.case_id), nm = norm(c.name);
+          return (m && (m.includes(nid) || nid.includes(m)))
+              || (nm && (nm.includes(nid) || nid.includes(nm)));
+        })
+        .map(c => c.case_id);
       db.prepare(`INSERT INTO cases(case_id, name) VALUES(?,?)`)
         .run(case_id, case_name ?? case_id);
+      if (similar.length) {
+        similarWarn = `\n⚠️ 類似案件が既に存在: ${similar.join(", ")} — 同一案件なら merge_cases で統合を検討してください`;
+      }
     }
     const t = autoProjectTag(tags ?? []);
     const tagsJson = JSON.stringify(t);
@@ -710,7 +859,39 @@ server.tool("save_case_note",
     syncNoteFts(id, key, content, tagsJson);
     initCaseLinks("note", id, case_id);
     await upsertVector("note", id, `${key ?? ""} ${content}`.slice(0, 8000));
-    return { content: [{ type: "text", text: `✅ 案件メモ保存 id:${id} case:${case_id}${key ? ` key:${key}` : ""}` }] };
+    return { content: [{ type: "text", text: `✅ 案件メモ保存 id:${id} case:${case_id}${key ? ` key:${key}` : ""}${similarWarn}${redirectNote}` }] };
+  }
+);
+
+// ─── merge_cases（分裂した案件の統合） ──────────────────────────
+server.tool("merge_cases",
+  "Merge one case into another (moves notes/conversations, archives source). / 分裂した案件を統合（メモ・会話を移動し、統合元をアーカイブ）。",
+  {
+    from_case_id: z.string().describe("Source case ID (will be archived) / 統合元の案件ID"),
+    to_case_id:   z.string().describe("Destination case ID / 統合先の案件ID"),
+  },
+  ({ from_case_id, to_case_id }) => {
+    if (from_case_id === to_case_id) {
+      return { content: [{ type: "text", text: "統合元と統合先が同一です。" }] };
+    }
+    const from = db.prepare(`SELECT * FROM cases WHERE case_id=?`).get(from_case_id);
+    const to = db.prepare(`SELECT * FROM cases WHERE case_id=?`).get(to_case_id);
+    if (!from) return { content: [{ type: "text", text: `統合元 "${from_case_id}" は存在しません。` }] };
+    if (!to) return { content: [{ type: "text", text: `統合先 "${to_case_id}" は存在しません。` }] };
+    // 循環防止: 統合先が(連鎖の果てに)統合元を指す場合は拒否
+    if (resolveCaseId(to_case_id) === from_case_id) {
+      return { content: [{ type: "text", text: "循環統合になるため拒否しました。" }] };
+    }
+    const movedNoteIds = db.prepare(`SELECT id FROM notes WHERE case_id=?`).all(from_case_id).map(r => r.id);
+    const nMoved = db.prepare(`UPDATE notes SET case_id=? WHERE case_id=?`).run(to_case_id, from_case_id).changes;
+    const cMoved = db.prepare(`UPDATE conversations SET case_id=? WHERE case_id=?`).run(to_case_id, from_case_id).changes;
+    // merged_intoを刻む: 以後、旧IDへの保存・検索は統合先に自動解決される
+    db.prepare(`UPDATE cases SET status='archived', merged_into=?,
+      updated_at=datetime('now','localtime') WHERE case_id=?`).run(to_case_id, from_case_id);
+    db.prepare(`UPDATE cases SET updated_at=datetime('now','localtime') WHERE case_id=?`).run(to_case_id);
+    // 移動したメモを統合先の案件メンバーとしてヘブ則リンクに再接続
+    for (const nid of movedNoteIds) initCaseLinks("note", nid, to_case_id);
+    return { content: [{ type: "text", text: `🔀 "${from_case_id}" → "${to_case_id}" に統合: メモ${nMoved}件・会話${cMoved}件を移動。旧IDへの保存・検索は以後 "${to_case_id}" に自動転送されます。` }] };
   }
 );
 
@@ -739,8 +920,15 @@ server.tool("invalidate_note",
       await upsertVector("note", noteId, `${updatedNote.key ?? ""} ${decrypt(updatedNote.content) ?? ""}`.slice(0, 8000));
     }
     if (reason) {
-      db.prepare(`INSERT INTO notes(key,content,tags,valid_at) VALUES(?,?,?,datetime('now','localtime'))`)
-        .run(`invalidation-reason-${noteId}`, encrypt(`id:${noteId}の無効化理由: ${reason}`), "[]");
+      // 同一メモの再無効化でもUNIQUE衝突しないようupsert
+      const reasonKey = `invalidation-reason-${noteId}`;
+      const reasonText = `id:${noteId}の無効化理由: ${reason}`;
+      db.prepare(`INSERT INTO notes(key,content,tags,valid_at) VALUES(?,?,?,datetime('now','localtime'))
+        ON CONFLICT(key) DO UPDATE SET content=excluded.content,
+        valid_at=excluded.valid_at, updated_at=datetime('now','localtime')`)
+        .run(reasonKey, encrypt(reasonText), "[]");
+      const rid = db.prepare(`SELECT id FROM notes WHERE key=?`).get(reasonKey)?.id;
+      if (rid) syncNoteFts(rid, reasonKey, reasonText, "[]");
     }
     return { content: [{ type: "text", text: `⏰ id:${noteId} を無効化しました。${reason ? ` 理由: ${reason}` : ""}` }] };
   }
@@ -764,7 +952,8 @@ server.tool("list_cases",
     const rows = db.prepare(q).all();
     if (!rows.length) return { content: [{ type: "text", text: "登録済みの案件はありません。" }] };
     const text = rows.map(r => {
-      return `[${r.status}] ${r.case_id}: ${r.name} (メモ:${r.noteCount} 会話:${r.convCount}) ${r.updated_at}`;
+      const st = r.merged_into ? `${r.status}→${r.merged_into}` : r.status;
+      return `[${st}] ${r.case_id}: ${r.name} (メモ:${r.noteCount} 会話:${r.convCount}) ${r.updated_at}`;
     }).join("\n");
     return { content: [{ type: "text", text: `📁 案件一覧 (${rows.length}件)\n\n${text}` }] };
   }
@@ -774,11 +963,14 @@ server.tool("get_case",
   "Get case details with notes and conversations. / 指定案件の詳細とメモ・会話一覧を取得",
   { case_id: z.string().describe("Case ID / 案件ID") },
   ({ case_id }) => {
+    const requestedId = case_id;
+    case_id = resolveCaseId(case_id);
     const c = db.prepare(`SELECT * FROM cases WHERE case_id=?`).get(case_id);
     if (!c) return { content: [{ type: "text", text: `案件 "${case_id}" は存在しません。` }] };
+    const redirectNote = case_id !== requestedId ? `（"${requestedId}" は統合済み → "${case_id}" を表示）\n` : "";
     const notes = db.prepare(`SELECT id, key, content, tags, created_at FROM notes WHERE case_id=? ORDER BY created_at DESC`).all(case_id);
     const convs = db.prepare(`SELECT id, title, summary, created_at FROM conversations WHERE case_id=? ORDER BY created_at DESC`).all(case_id);
-    let text = `📁 案件: ${c.name} (${c.case_id})\nステータス: ${c.status}\n作成: ${c.created_at}\n\n`;
+    let text = `${redirectNote}📁 案件: ${c.name} (${c.case_id})\nステータス: ${c.status}\n作成: ${c.created_at}\n\n`;
     if (convs.length) {
       text += `## 会話 (${convs.length}件)\n`;
       text += convs.map(r => `  id:${r.id} ${decrypt(r.title)} [${r.created_at}]`).join("\n");
@@ -813,6 +1005,7 @@ server.tool("save_agent_memory",
     case_id:  z.string().optional().describe("Case ID / 案件ID"),
   },
   async ({ agent_id, content, key, tags, case_id }) => {
+    case_id = resolveCaseId(case_id);
     const t = autoProjectTag(tags ?? []);
     t.push(`agent:${agent_id}`);
     const tagsJson = JSON.stringify(t);
@@ -864,37 +1057,44 @@ server.tool("rag_query",
     case_id: z.string().optional().describe("Filter by case ID / 案件IDで絞り込み"),
   },
   async ({ query, limit, case_id }) => {
+    case_id = resolveCaseId(case_id);
     const results = new Map(); // key: "type:id" → { type, id, score, source }
 
-    // 1. FTS5 キーワード検索
-    const words = query.trim().split(/\s+/);
+    // 1. FTS5 キーワード検索（全語AND→0件ならORに段階緩和・無効化済みメモ除外・関連度順）
+    const words = query.trim().split(/\s+/).filter(Boolean);
     const hasShortWord = words.some(w => [...w].length < 3);
-    let ftsRows;
-    if (hasShortWord) {
-      const notesLike = words.map(() => "notes_fts.content LIKE ? ESCAPE '\\'").join(" AND ");
-      const convsLike = words.map(() => "conversations_fts.content LIKE ? ESCAPE '\\'").join(" AND ");
-      const likeParams = words.map(w => "%" + escapeLike(w) + "%");
-      const caseFilter = case_id ? " AND t.case_id=?" : "";
-      const caseParams = case_id ? [case_id] : [];
-      ftsRows = db.prepare(
-        "SELECT 'note' as type, t.id FROM notes_fts JOIN notes t ON notes_fts.rowid=t.id WHERE " + notesLike + caseFilter +
-        " UNION ALL SELECT 'conversation', t.id FROM conversations_fts JOIN conversations t ON conversations_fts.rowid=t.id WHERE " +
-        convsLike + caseFilter + " LIMIT 20"
-      ).all(...likeParams, ...caseParams, ...likeParams, ...caseParams);
-    } else {
-      const q = buildFtsQuery(words);
-      if (!q) {
-        ftsRows = []; // 全語が * のみ等で空クエリ → FTSヒットなし扱い（ベクトル検索は継続）
-      } else if (case_id) {
-        ftsRows = db.prepare(
-          "SELECT 'note' as type, t.id FROM notes_fts JOIN notes t ON notes_fts.rowid=t.id WHERE notes_fts MATCH ? AND t.case_id=?" +
-          " UNION ALL SELECT 'conversation', t.id FROM conversations_fts JOIN conversations t ON conversations_fts.rowid=t.id WHERE conversations_fts MATCH ? AND t.case_id=? LIMIT 20"
-        ).all(q, case_id, q, case_id);
-      } else {
-        ftsRows = db.prepare(
-          "SELECT 'note' as type, t.id FROM notes_fts JOIN notes t ON notes_fts.rowid=t.id WHERE notes_fts MATCH ?" +
-          " UNION ALL SELECT 'conversation', t.id FROM conversations_fts JOIN conversations t ON conversations_fts.rowid=t.id WHERE conversations_fts MATCH ? LIMIT 20"
-        ).all(q, q);
+    const noteCaseFilter = case_id ? " AND t.case_id=?" : "";
+    const caseParams = case_id ? [case_id] : [];
+
+    const runLike = (joiner) => {
+      const noteCols = ["key", "content", "tags"];
+      const convCols = ["title", "summary", "content", "tags"];
+      const clause = (table, cols) => words.map(() =>
+        "(" + cols.map(col => table + "." + col + " LIKE ? ESCAPE '\\'").join(" OR ") + ")"
+      ).join(joiner);
+      const paramsFor = (cols) => words.flatMap(w => cols.map(() => "%" + escapeLike(w) + "%"));
+      return db.prepare(
+        "SELECT 'note' as type, t.id FROM notes_fts JOIN notes t ON notes_fts.rowid=t.id WHERE (" +
+        clause("notes_fts", noteCols) + ") AND t.invalid_at IS NULL" + noteCaseFilter +
+        " UNION ALL SELECT 'conversation', t.id FROM conversations_fts JOIN conversations t ON conversations_fts.rowid=t.id WHERE (" +
+        clause("conversations_fts", convCols) + ")" + noteCaseFilter + " LIMIT 20"
+      ).all(...paramsFor(noteCols), ...caseParams, ...paramsFor(convCols), ...caseParams);
+    };
+    const runFts = (op) => {
+      const q = buildFtsQuery(words, op);
+      if (!q) return []; // 全語が * のみ等 → FTSヒットなし扱い（ベクトル検索は継続）
+      return db.prepare(
+        "SELECT 'note' as type, t.id, rank as rnk FROM notes_fts JOIN notes t ON notes_fts.rowid=t.id WHERE notes_fts MATCH ? AND t.invalid_at IS NULL" + noteCaseFilter +
+        " UNION ALL SELECT 'conversation', t.id, rank as rnk FROM conversations_fts JOIN conversations t ON conversations_fts.rowid=t.id WHERE conversations_fts MATCH ?" + noteCaseFilter +
+        " ORDER BY rnk LIMIT 20"
+      ).all(q, ...caseParams, q, ...caseParams);
+    };
+
+    let ftsRows = [];
+    if (words.length) {
+      ftsRows = hasShortWord ? runLike(" AND ") : runFts(" AND ");
+      if (!ftsRows.length && words.length > 1) {
+        ftsRows = hasShortWord ? runLike(" OR ") : runFts(" OR ");
       }
     }
     for (let i = 0; i < ftsRows.length; i++) {
@@ -996,6 +1196,7 @@ server.tool("semantic_search",
     case_id: z.string().optional().describe("Filter by case ID / 案件IDで絞り込み"),
   },
   async ({ query, limit, case_id }) => {
+    case_id = resolveCaseId(case_id);
     if (!VECTOR_ENABLED) {
       return { content: [{ type: "text", text: "⚠️ ベクトル検索は無効です。EMBEDDING_API_KEY または OPENAI_API_KEY を設定してください。" }] };
     }
@@ -1124,9 +1325,9 @@ server.tool("traverse_memory_graph",
 );
 
 server.tool("memory_stats",
-  "Show memory statistics (counts, links, cases, vectors). / メモリMCPの統計情報",
+  "Show memory statistics + health (counts, links, cases, vectors, embedding endpoint). / メモリMCPの統計・健全性診断",
   {},
-  () => {
+  async () => {
     const noteCount = db.prepare(`SELECT COUNT(*) as c FROM notes`).get().c;
     const convCount = db.prepare(`SELECT COUNT(*) as c FROM conversations`).get().c;
     const linkCount = db.prepare(`SELECT COUNT(*) as c FROM memory_links`).get().c;
@@ -1140,19 +1341,34 @@ server.tool("memory_stats",
     const agentLine = agentNotes.length > 0
       ? `  エージェント記憶: ${agentNotes.map(a => `${a.agent_id}(${a.c}件)`).join(", ")}`
       : `  エージェント記憶: なし`;
+
+    // ベクトル健全性: 実際にエンドポイントを叩いて可用性を確認
+    const totalRows = noteCount + convCount;
+    let vecLine;
+    if (!VECTOR_ENABLED) {
+      vecLine = `  ベクトル: ${vecCount}/${totalRows}件 ⚠️ 無効 (EMBEDDING_API_KEY未設定)`;
+    } else {
+      const probe = await getEmbedding("health check", 3000);
+      vecLine = probe
+        ? `  ベクトル: ${vecCount}/${totalRows}件 ✅ ${EMBEDDING_MODEL} @ ${EMBEDDING_URL}`
+        : `  ベクトル: ${vecCount}/${totalRows}件 ⚠️ エンドポイント応答なし (${EMBEDDING_URL}) — 保存・検索はFTSのみで継続`;
+    }
+    let dbSize = "";
+    try { dbSize = ` (${(statSync(DB_PATH).size / 1024 / 1024).toFixed(1)}MB)`; } catch {}
+
     return {
       content: [{
         type: "text",
         text: [
-          `📊 Memory MCP Stats (v3.0 Zep-inspired)`,
+          `📊 Memory MCP Stats (v3.1)`,
           `  メモ: ${noteCount}件 (時間軸付き:${temporalCount} 無効:${invalidCount})`,
           `  会話: ${convCount}件`,
           `  案件: ${caseCount}件 (active)`,
-          `  ヘブ則リンク: ${linkCount}件 (avg_w: ${avgWeight.toFixed(3)}, strong>0.5: ${strongLinks}件)`,
+          `  ヘブ則リンク: ${linkCount}件 (avg_w: ${avgWeight.toFixed(3)}, strong>0.5: ${strongLinks}件, 最終減衰: ${metaGet("last_decay") ?? "未実施"})`,
           agentLine,
-          `  ベクトル: ${vecCount}件 ${VECTOR_ENABLED ? `✅ (${EMBEDDING_MODEL})` : "⚠️ 無効 (EMBEDDING_API_KEY未設定)"}`,
-          `  DB: ${DB_PATH}`,
-          `  暗号化: AES-256-GCM ✅ (注: FTSインデックスは検索のため平文保存)`, // M2 fix: FTS平文である旨を追記
+          vecLine,
+          `  DB: ${DB_PATH}${dbSize}`,
+          `  暗号化: AES-256-GCM ✅ (注: FTSインデックスは検索のため平文保存)`,
         ].join("\n"),
       }],
     };
@@ -1334,6 +1550,36 @@ server.tool("context_gauge",
   }
 );
 
+// ─── ベクトル自動補完（起動後に非同期・未ベクトル行のみ） ────────
+// エンドポイント復旧後や過去データに対して人手のbackfill実行を不要にする。
+// 多重起動対策: metaのタイムスタンプで10分間は他プロセスの実行を尊重する。
+async function backfillMissingVectors(maxItems = 300) {
+  if (!VECTOR_ENABLED) return;
+  const last = Number(metaGet("backfill_ts") ?? 0);
+  if (Date.now() - last < 10 * 60 * 1000) return;
+  metaSet("backfill_ts", Date.now());
+
+  // 疎通確認（落ちていれば即撤退）
+  if (!(await getEmbedding("backfill probe", 3000))) return;
+
+  const notes = db.prepare(`SELECT id, key, content FROM notes
+    WHERE id NOT IN (SELECT id FROM vectors WHERE type='note') LIMIT ?`).all(maxItems);
+  let done = 0;
+  for (const n of notes) {
+    await upsertVector("note", n.id, `${n.key ?? ""} ${decrypt(n.content)}`.slice(0, 8000));
+    done++;
+  }
+  const convs = db.prepare(`SELECT id, title, summary, content FROM conversations
+    WHERE id NOT IN (SELECT id FROM vectors WHERE type='conversation') LIMIT ?`).all(Math.max(0, maxItems - done));
+  for (const c of convs) {
+    await upsertVector("conversation", c.id,
+      `${decrypt(c.title)} ${decrypt(c.summary) ?? ""} ${decrypt(c.content)}`.slice(0, 8000));
+    done++;
+  }
+  if (done > 0) console.error(`[memory-mcp] vector backfill: ${done}件補完`);
+}
+
 // ─── 起動 ───────────────────────────────────────────────────────
 const transport = new StdioServerTransport();
 await server.connect(transport);
+setTimeout(() => backfillMissingVectors().catch(() => {}), 3000);

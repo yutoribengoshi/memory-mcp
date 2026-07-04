@@ -1,6 +1,6 @@
 {
   "name": "memory-mcp",
-  "version": "1.0.0",
+  "version": "3.1.0",
   "description": "Long-term memory MCP server for Claude Code — persistent notes, conversations, full-text search (Japanese), case management, Hebbian links, and AES-256-GCM encryption",
   "type": "module",
   "main": "index.js",

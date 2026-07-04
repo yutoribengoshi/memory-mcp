@@ -10,7 +10,7 @@ Long-term memory MCP server for Claude Code. Your AI remembers context across se
 
 - **SQLite Persistence** — Notes and conversations survive across sessions
 - **Japanese Full-Text Search** — FTS5 with trigram tokenizer for CJK support
-- **Semantic Search** — Optional vector search via OpenAI-compatible embedding APIs
+- **Semantic Search** — Vector search via OpenAI-compatible embedding APIs. Zero-config with local Ollama (`nomic-embed-text`); falls back gracefully to FTS-only when no endpoint is reachable
 - **AES-256-GCM Encryption** — All stored data is encrypted at rest
 - **Case Management** — Organize memories by project or case
 - **Hebbian Links** — Memories accessed together automatically strengthen their connections
@@ -37,9 +37,13 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-### Optional: Enable Semantic Search
+### Semantic Search
 
-Set an OpenAI-compatible API key to enable vector search:
+By default (no env vars needed), the server tries a local Ollama at `http://localhost:11434` with `nomic-embed-text`. If the endpoint is unreachable, everything still works via FTS. Missing vectors are backfilled automatically in the background once the endpoint becomes available.
+
+Config resolution order: env vars > `~/.memory-mcp/config.json` (`embedding_api_key` / `embedding_url` / `embedding_model`) > Ollama defaults.
+
+To use OpenAI instead, set an API key:
 
 ```json
 {
@@ -83,6 +87,7 @@ Also supports custom endpoints (Ollama, LMStudio, etc.):
 | `list_cases` | List all cases |
 | `get_case` | Get case details with notes and conversations |
 | `archive_case` | Archive a case |
+| `merge_cases` | Merge a fragmented case into another (moves notes/conversations) |
 | `broadcast_note` | Save and broadcast to all sessions |
 | `get_memory_links` | View Hebbian links for a memory |
 | `memory_stats` | Show statistics |
@@ -93,10 +98,11 @@ Also supports custom endpoints (Ollama, LMStudio, etc.):
 
 Inspired by Hebb's rule in neuroscience — "neurons that fire together wire together."
 
-- Memories searched within 5 minutes of each other get automatically linked
+- Memories retrieved together by one query get linked (co-retrieval)
+- Memories searched within 5 minutes of each other get linked — search history is persisted, so this works across sessions
 - Memories in the same case get linked
-- Links strengthen with repeated co-access
-- Unused links decay after 30 days (weight x 0.95)
+- Links strengthen with repeated co-access; opening a search result (`get_conversation`) reinforces it
+- Unused links decay after 30 days (weight x 0.95, applied at most once per day)
 - Links below 0.01 are pruned
 
 ### Data Storage
@@ -133,7 +139,7 @@ Claude Code 用の長期記憶 MCP サーバー。セッションを跨いでも
 
 - **SQLite 永続化** — メモ・会話を SQLite に保存。セッション終了後も記憶が残る
 - **日本語全文検索** — FTS5 trigram トークナイザーで日本語の部分一致検索に対応
-- **セマンティック検索** — OpenAI互換のEmbedding APIでベクトル類似検索（オプション）
+- **セマンティック検索** — OpenAI互換のEmbedding APIでベクトル類似検索。ローカルOllama（`nomic-embed-text`）なら設定不要で自動有効。到達不能時はFTSのみで劣化なく継続
 - **AES-256-GCM 暗号化** — 保存データは自動で暗号化。鍵は `~/.memory-mcp/.key` に保持
 - **案件別管理** — 案件（case）単位でメモ・会話を整理。弁護士の実務から生まれた設計
 - **ヘブ則リンク** — 連続検索されたメモを自動リンク。使うほど関連記憶が強化される
@@ -162,9 +168,13 @@ npm install
 }
 ```
 
-### オプション: セマンティック検索を有効化
+### セマンティック検索
 
-OpenAI互換のAPIキーを設定するとベクトル検索が使えます:
+既定（env指定なし）ではローカル Ollama（`http://localhost:11434` + `nomic-embed-text`）を自動で使います。エンドポイント不達でもFTS検索は通常どおり動作し、復旧後は未ベクトル分がバックグラウンドで自動補完されます。
+
+設定の解決順: 環境変数 > `~/.memory-mcp/config.json`（`embedding_api_key` / `embedding_url` / `embedding_model`） > Ollama既定値。
+
+OpenAIを使う場合はAPIキーを設定:
 
 ```json
 {
@@ -226,6 +236,7 @@ Claude Code のチャットでそのまま使えます。
 | `list_cases` | 案件一覧 |
 | `get_case` | 案件の詳細とメモ・会話一覧 |
 | `archive_case` | 案件をアーカイブ |
+| `merge_cases` | 分裂した案件を統合（メモ・会話を移動） |
 | `broadcast_note` | メモを保存し全セッションに通知 |
 | `get_memory_links` | ヘブ則リンク（関連記憶）を取得 |
 | `memory_stats` | 統計情報 |
@@ -234,10 +245,11 @@ Claude Code のチャットでそのまま使えます。
 
 神経科学のヘブの法則（"一緒に発火するニューロンは結びつく"）を応用した関連記憶システム。
 
-- 5分以内に連続検索されたメモ同士が自動リンク
+- 同じ検索で一緒にヒットしたメモ同士が自動リンク（共起）
+- 5分以内に連続検索されたメモ同士も自動リンク（検索履歴はDBに永続化されるためセッションを跨いでも学習する）
 - 同じ案件のメモも自動リンク
-- 検索するたびに関連記憶が表示される
-- 30日以上アクセスされないリンクは自動減衰（weight × 0.95）
+- 検索後に `get_conversation` で開くと「有用だった」シグナルとしてさらに強化
+- 30日以上アクセスされないリンクは自動減衰（weight × 0.95・1日1回まで）
 - weight < 0.01 のリンクは自動削除
 
 ## 動作要件
